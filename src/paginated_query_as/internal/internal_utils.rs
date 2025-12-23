@@ -1,5 +1,5 @@
 use crate::paginated_query_as::internal::{
-    DEFAULT_MIN_PAGE_SIZE, DEFAULT_PAGE, DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
+    DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
 };
 use crate::QuerySortDirection;
 use serde::Serialize;
@@ -60,14 +60,6 @@ where
     result
 }
 
-pub fn default_page() -> i64 {
-    DEFAULT_PAGE
-}
-
-pub fn default_page_size() -> i64 {
-    DEFAULT_MIN_PAGE_SIZE
-}
-
 pub fn default_search_columns() -> Option<Vec<String>> {
     Some(
         DEFAULT_SEARCH_COLUMN_NAMES
@@ -95,6 +87,7 @@ pub fn quote_identifier(identifier: &str) -> String {
         .join(".")
 }
 
+#[allow(dead_code)]
 pub fn extract_digits_from_strings(val: impl Into<String>) -> String {
     val.into().chars().filter(|c| c.is_ascii_digit()).collect()
 }
@@ -102,21 +95,8 @@ pub fn extract_digits_from_strings(val: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paginated_query_as::internal::DEFAULT_MIN_PAGE_SIZE;
     use crate::paginated_query_as::models::QuerySortDirection;
     use serde::Serialize;
-
-    #[test]
-    fn test_default_page() {
-        assert_eq!(default_page(), DEFAULT_PAGE);
-        assert_eq!(default_page(), 1);
-    }
-
-    #[test]
-    fn test_default_page_size() {
-        assert_eq!(default_page_size(), DEFAULT_MIN_PAGE_SIZE);
-        assert_eq!(default_page_size(), 10);
-    }
 
     #[test]
     fn test_default_search_columns() {

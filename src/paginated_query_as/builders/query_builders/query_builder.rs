@@ -1,5 +1,5 @@
 use crate::paginated_query_as::internal::{
-    ColumnProtection, ComputedProperty, ComputedPropertyBuilder, FieldType, QueryDialect,
+    ColumnProtection, FieldType, QueryDialect, VirtualColumn, VirtualColumnBuilder,
 };
 use crate::paginated_query_as::models::FilterOperator;
 use crate::QueryParams;
@@ -20,6 +20,8 @@ pub struct QueryBuildResult<'q, DB: Database> {
     pub arguments: DB::Arguments<'q>,
     /// JOIN clauses that should be included in the query (in order)
     pub joins: Vec<String>,
+    /// Table alias for column references in SELECT clause (e.g., "base_query")
+    pub table_alias: String,
 }
 
 pub struct QueryBuilder<'q, T, DB: Database> {
@@ -33,12 +35,14 @@ pub struct QueryBuilder<'q, T, DB: Database> {
     pub(crate) column_validation_enabled: bool,
     pub(crate) dialect: Box<dyn QueryDialect>,
     pub(crate) _phantom: PhantomData<&'q T>,
-    /// Computed properties for virtual columns (e.g., from joins)
-    pub(crate) computed_properties: HashMap<String, ComputedProperty>,
+    /// Virtual columns (e.g., from joins or computed expressions)
+    pub(crate) virtual_columns: HashMap<String, VirtualColumn>,
     /// Active JOIN clauses (in order, no duplicates)
     pub(crate) active_joins: Vec<String>,
-    /// Optional table prefix for column references (e.g., "base_query" for CTE contexts)
-    pub(crate) table_prefix: Option<String>,
+    /// Table alias for column references (e.g., "base_query" for CTE contexts)
+    pub(crate) table_alias: String,
+    /// Explicit column cast overrides (takes precedence over inferred types)
+    pub(crate) column_cast_overrides: HashMap<String, FieldType>,
 }
 
 impl<'q, T, DB> QueryBuilder<'q, T, DB>
@@ -56,15 +60,15 @@ where
     ///
     /// # Returns
     ///
-    /// Returns `true` if the column exists in the valid columns list or is a computed property.
+    /// Returns `true` if the column exists in the valid columns list or is a virtual column.
     pub(crate) fn has_column(&self, column: &str) -> bool {
         self.valid_columns.contains(&column.to_string())
-            || self.computed_properties.contains_key(column)
+            || self.virtual_columns.contains_key(column)
     }
 
     fn is_column_safe(&self, column: &str) -> bool {
-        // Computed properties bypass validation (developer-trusted)
-        if self.computed_properties.contains_key(column) {
+        // Virtual columns bypass validation (developer-trusted)
+        if self.virtual_columns.contains_key(column) {
             return true;
         }
 
@@ -84,9 +88,9 @@ where
         }
     }
 
-    /// Activates joins for a computed property (adds to active_joins if not already present).
-    fn activate_joins(&mut self, property: &ComputedProperty) {
-        for join in &property.joins {
+    /// Activates joins for a virtual column (adds to active_joins if not already present).
+    fn activate_joins(&mut self, virtual_col: &VirtualColumn) {
+        for join in &virtual_col.joins {
             if !self.active_joins.contains(join) {
                 self.active_joins.push(join.clone());
             }
@@ -98,11 +102,13 @@ where
         self.active_joins.clone()
     }
 
-    /// Sets a table prefix for column references.
+    /// Sets a table alias for column references.
     ///
     /// When using `QueryBuilder` with `PaginatedQueryBuilder`, the query is wrapped in a CTE
     /// named `base_query`. If you have JOINs that introduce columns with the same names as
-    /// your main table, you need to prefix columns to avoid ambiguity.
+    /// your main table, you need to use an alias to avoid ambiguity.
+    ///
+    /// By default, the alias is set to `"base_query"`.
     ///
     /// # Example
     ///
@@ -118,30 +124,67 @@ where
     /// }
     ///
     /// let result = QueryBuilder::<Order, Postgres>::new()
-    ///     .with_table_prefix("base_query")  // Columns become "base_query"."column_name"
+    ///     .with_table_alias("orders")  // Columns become "orders"."column_name"
     ///     .build();
     /// ```
-    pub fn with_table_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.table_prefix = Some(prefix.into());
+    pub fn with_table_alias(mut self, alias: impl Into<String>) -> Self {
+        self.table_alias = alias.into();
         self
     }
 
-    /// Formats a column name with the table prefix if set.
-    /// Returns `"prefix"."column"` if prefix is set, otherwise just `"column"`.
-    fn format_column(&self, column: &str) -> String {
-        match &self.table_prefix {
-            Some(prefix) => format!("{}.{}", self.dialect.quote_identifier(prefix), self.dialect.quote_identifier(column)),
-            None => self.dialect.quote_identifier(column),
-        }
+    /// Overrides the cast type for a specific column when filtering.
+    ///
+    /// This is useful when the column type cannot be inferred from the struct
+    /// (e.g., `Option<T>` fields that serialize to null) or when the parsed filter
+    /// value type doesn't match the actual database column type.
+    ///
+    /// This override takes precedence over types inferred from:
+    /// - Struct field metadata
+    /// - Virtual column types
+    /// - Filter value type inference
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - The column name to override the cast for
+    /// * `field_type` - The `FieldType` to use for casting this column
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sqlx::Postgres;
+    /// use serde::Serialize;
+    /// use sqlx_paginated::{QueryBuilder, FieldType};
+    ///
+    /// #[derive(Serialize, Default)]
+    /// struct Bill {
+    ///     id: i64,
+    ///     gl_code: Option<String>,  // Serializes to null, type is Unknown
+    /// }
+    ///
+    /// // Without override: gl_code=Eq:123 would generate "gl_code" = $1::bigint
+    /// // With override: gl_code=Eq:123 generates "gl_code" = $1 (no cast for String)
+    /// let query_builder = QueryBuilder::<Bill, Postgres>::new()
+    ///     .with_column_cast("gl_code", FieldType::String)
+    ///     .build();
+    /// ```
+    pub fn with_column_cast(mut self, column: impl Into<String>, field_type: FieldType) -> Self {
+        self.column_cast_overrides.insert(column.into(), field_type);
+        self
     }
 
-    /// Registers a computed property (virtual column) that can be used in search and filter operations.
+    /// Formats a column name with the table alias.
+    /// Returns `"alias"."column"` format.
+    fn format_column(&self, column: &str) -> String {
+        format!("{}.{}", self.dialect.quote_identifier(&self.table_alias), self.dialect.quote_identifier(column))
+    }
+
+    /// Registers a virtual column that can be used in search and filter operations.
     ///
-    /// Computed properties allow you to search and filter by columns that don't exist directly
+    /// Virtual columns allow you to search and filter by columns that don't exist directly
     /// in your struct, such as columns from joined tables or computed SQL expressions.
     ///
-    /// The closure receives a `ComputedPropertyBuilder` that can be used to configure joins,
-    /// and returns the SQL expression to use for this property.
+    /// The closure receives a `VirtualColumnBuilder` that can be used to configure joins,
+    /// and returns the SQL expression to use for this column.
     ///
     /// **IMPORTANT**: When using with `PaginatedQueryBuilder`, JOINs must reference `base_query`
     /// (not the original table name) because the query is wrapped in a CTE:
@@ -152,7 +195,7 @@ where
     /// # Arguments
     ///
     /// * `name` - The virtual column name to use in search_columns and filters
-    /// * `f` - Closure that configures the property and returns the SQL expression
+    /// * `f` - Closure that configures the column and returns the SQL expression
     ///
     /// # Example
     ///
@@ -169,30 +212,30 @@ where
     ///
     /// // When using with PaginatedQueryBuilder, reference base_query in JOINs:
     /// let result = QueryBuilder::<Order, Postgres>::new()
-    ///     .with_computed_property("counterparty_name", |cp| {
+    ///     .with_virtual_column("counterparty_name", |vc| {
     ///         // Note: Use "base_query" not "orders" when used with PaginatedQueryBuilder
-    ///         cp.with_join("LEFT JOIN counterparty ON counterparty.id = base_query.counterparty_id");
+    ///         vc.with_join("LEFT JOIN counterparty ON counterparty.id = base_query.counterparty_id");
     ///         "counterparty.legal_name"
     ///     })
     ///     // For computed expressions without joins (no table reference needed)
-    ///     .with_computed_property("amount_money", |_cp| {
+    ///     .with_virtual_column("amount_money", |_vc| {
     ///         "(amount_micros / 1000000)::money"
     ///     })
     ///     .build();
     /// ```
-    pub fn with_computed_property<F>(mut self, name: impl Into<String>, f: F) -> Self
+    pub fn with_virtual_column<F>(mut self, name: impl Into<String>, f: F) -> Self
     where
-        F: FnOnce(&mut ComputedPropertyBuilder) -> &str,
+        F: FnOnce(&mut VirtualColumnBuilder) -> &str,
     {
-        let mut builder = ComputedPropertyBuilder::new();
+        let mut builder = VirtualColumnBuilder::new();
         let expression = f(&mut builder);
 
-        self.computed_properties.insert(
+        self.virtual_columns.insert(
             name.into(),
-            ComputedProperty {
+            VirtualColumn {
                 expression: expression.to_string(),
                 joins: builder.joins,
-                field_type: builder.field_type,
+                column_type: builder.column_type,
             },
         );
         self
@@ -249,23 +292,23 @@ where
                     let pattern = format!("%{}%", search);
                     let next_argument = self.arguments.len() + 1;
 
-                    let mut joins_to_activate: Vec<ComputedProperty> = Vec::new();
+                    let mut joins_to_activate: Vec<VirtualColumn> = Vec::new();
 
                     let search_conditions: Vec<String> = columns
                         .iter()
                         .filter_map(|column| {
-                            if let Some(prop) = self.computed_properties.get(column).cloned() {
-                                joins_to_activate.push(prop.clone());
+                            if let Some(vc) = self.virtual_columns.get(column).cloned() {
+                                joins_to_activate.push(vc.clone());
                                 let placeholder = self.dialect.placeholder(next_argument);
-                                return if prop.field_type == FieldType::String {
+                                return if vc.column_type == FieldType::String {
                                     Some(format!(
                                         "LOWER({}) LIKE LOWER({})",
-                                        prop.expression, placeholder
+                                        vc.expression, placeholder
                                     ))
                                 } else {
                                     Some(format!(
                                         "({})::text LIKE {}",
-                                        prop.expression, placeholder
+                                        vc.expression, placeholder
                                     ))
                                 };
                             }
@@ -298,9 +341,9 @@ where
                         })
                         .collect();
 
-                    // Activate joins for used computed properties
-                    for prop in joins_to_activate {
-                        self.activate_joins(&prop);
+                    // Activate joins for used virtual columns
+                    for vc in joins_to_activate {
+                        self.activate_joins(&vc);
                     }
 
                     if !search_conditions.is_empty() {
@@ -354,11 +397,11 @@ where
         for filter in &params.filters {
             let field = &filter.field;
 
-            // Check for computed property first
+            // Check for virtual column first
             let (table_column, field_type) =
-                if let Some(prop) = self.computed_properties.get(field).cloned() {
-                    self.activate_joins(&prop);
-                    (prop.expression.clone(), prop.field_type.clone())
+                if let Some(vc) = self.virtual_columns.get(field).cloned() {
+                    self.activate_joins(&vc);
+                    (vc.expression.clone(), vc.column_type.clone())
                 } else {
                     if !self.is_column_safe(field) {
                         #[cfg(feature = "tracing")]
@@ -372,7 +415,13 @@ where
                 };
 
 
-            let effective_field_type = if field_type == FieldType::Unknown {
+            // Type resolution order (highest priority first):
+            // 1. Explicit column_cast_overrides (from with_column_cast)
+            // 2. Virtual column or field_meta type (if not Unknown)
+            // 3. Filter value type inference (fallback when type is Unknown)
+            let effective_field_type = if let Some(override_type) = self.column_cast_overrides.get(field) {
+                override_type.clone()
+            } else if field_type == FieldType::Unknown {
                 filter.value.to_field_type()
             } else {
                 field_type
@@ -381,42 +430,50 @@ where
 
             let type_cast = self.dialect.type_cast(&effective_field_type);
 
+            // If the filter value is a Date, cast the column to date for proper comparison
+            // This ensures timestamp columns match all records on that calendar day
+            let column_expr = if effective_field_type == FieldType::Date {
+                format!("{}::date", table_column)
+            } else {
+                table_column.clone()
+            };
+
             let condition = match filter.operator {
                 FilterOperator::Eq => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} = {}{}", table_column, placeholder, type_cast)
+                    format!("{} = {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Ne => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} != {}{}", table_column, placeholder, type_cast)
+                    format!("{} != {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Gt => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} > {}{}", table_column, placeholder, type_cast)
+                    format!("{} > {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Lt => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} < {}{}", table_column, placeholder, type_cast)
+                    format!("{} < {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Gte => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} >= {}{}", table_column, placeholder, type_cast)
+                    format!("{} >= {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Lte => {
                     let value = filter.value.to_bindable_string();
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
-                    format!("{} <= {}{}", table_column, placeholder, type_cast)
+                    format!("{} <= {}{}", column_expr, placeholder, type_cast)
                 }
                 FilterOperator::Like => {
                     let value = filter.value.to_bindable_string();
@@ -450,7 +507,7 @@ where
                             format!("{}{}", placeholder, type_cast)
                         })
                         .collect();
-                    format!("{} IN ({})", table_column, placeholders.join(", "))
+                    format!("{} IN ({})", column_expr, placeholders.join(", "))
                 }
                 FilterOperator::NotIn => {
                     let values = filter.value.to_bindable_strings();
@@ -462,7 +519,7 @@ where
                             format!("{}{}", placeholder, type_cast)
                         })
                         .collect();
-                    format!("{} NOT IN ({})", table_column, placeholders.join(", "))
+                    format!("{} NOT IN ({})", column_expr, placeholders.join(", "))
                 }
                 FilterOperator::IsNull => format!("{} IS NULL", table_column),
                 FilterOperator::IsNotNull => format!("{} IS NOT NULL", table_column),
@@ -473,7 +530,7 @@ where
                         self.arguments.add(values[0].clone()).unwrap_or_default();
                         let placeholder2 = self.dialect.placeholder(self.arguments.len() + 1);
                         self.arguments.add(values[1].clone()).unwrap_or_default();
-                        format!("{} BETWEEN {}{} AND {}{}", table_column, placeholder1, type_cast, placeholder2, type_cast)
+                        format!("{} BETWEEN {}{} AND {}{}", column_expr, placeholder1, type_cast, placeholder2, type_cast)
                     } else {
                         continue;
                     }
@@ -677,7 +734,8 @@ where
     /// Returns a `QueryBuildResult` containing:
     /// - `conditions`: List of SQL conditions for the WHERE clause
     /// - `arguments`: Database-specific arguments for parameter binding
-    /// - `joins`: JOIN clauses to include (only those needed by used computed properties)
+    /// - `joins`: JOIN clauses to include (only those needed by used virtual columns)
+    /// - `table_alias`: Table alias for SELECT clause (defaults to "base_query")
     ///
     /// # Example
     ///
@@ -697,13 +755,14 @@ where
     /// let result = QueryBuilder::<UserExample, Postgres>::new()
     ///     .with_search(&initial_params)
     ///     .build();
-    /// // Use result.conditions, result.arguments, result.joins
+    /// // Use result.conditions, result.arguments, result.joins, result.table_alias
     /// ```
     pub fn build(self) -> QueryBuildResult<'q, DB> {
         QueryBuildResult {
             conditions: self.conditions,
             arguments: self.arguments,
             joins: self.active_joins,
+            table_alias: self.table_alias,
         }
     }
 }
@@ -1072,6 +1131,406 @@ mod tests {
             result.conditions[0].contains("::text ILIKE"),
             "Expected column::text ILIKE for non-string field, got: {}",
             result.conditions[0]
+        );
+    }
+
+    // ========================================
+    // Date Column Casting Tests
+    // ========================================
+    // When filtering with a Date value, the column should be cast to ::date
+    // to ensure timestamp columns match all records on that calendar day
+
+    #[test]
+    fn test_eq_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        // Column should be cast to ::date for proper date comparison
+        assert!(
+            result.conditions[0].contains("::date ="),
+            "Expected column::date = for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_ne_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Ne,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date !="),
+            "Expected column::date != for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_gt_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Gt,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date >"),
+            "Expected column::date > for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_lt_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Lt,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date <"),
+            "Expected column::date < for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_gte_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Gte,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date >="),
+            "Expected column::date >= for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_lte_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Lte,
+            value: FilterValue::Date("2025-12-22".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date <="),
+            "Expected column::date <= for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_in_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::In,
+            value: FilterValue::Array(vec![
+                FilterValue::Date("2025-12-22".to_string()),
+                FilterValue::Date("2025-12-23".to_string()),
+            ]),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        // Column should be cast to ::date
+        assert!(
+            result.conditions[0].contains("::date IN"),
+            "Expected column::date IN for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_not_in_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::NotIn,
+            value: FilterValue::Array(vec![
+                FilterValue::Date("2025-12-22".to_string()),
+                FilterValue::Date("2025-12-23".to_string()),
+            ]),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date NOT IN"),
+            "Expected column::date NOT IN for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_between_date_filter_casts_column_to_date() {
+        let filter = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Between,
+            value: FilterValue::Array(vec![
+                FilterValue::Date("2025-12-01".to_string()),
+                FilterValue::Date("2025-12-31".to_string()),
+            ]),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::date BETWEEN"),
+            "Expected column::date BETWEEN for Date filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_datetime_filter_does_not_cast_column() {
+        // DateTime filter should NOT cast the column, only the value
+        let filter = Filter {
+            field: "optional_datetime".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::DateTime("2025-12-22T10:30:00Z".to_string()),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        // Should have ::timestamptz for the value, but column should NOT be cast
+        assert!(
+            result.conditions[0].contains("::timestamptz"),
+            "Expected ::timestamptz cast for value, got: {}",
+            result.conditions[0]
+        );
+        // The column itself should not have ::date cast
+        assert!(
+            !result.conditions[0].contains("::date"),
+            "DateTime filter should not cast column to date, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_int_filter_does_not_cast_column_to_date() {
+        // Non-date filters should NOT cast the column to ::date
+        let filter = Filter {
+            field: "id".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(123),
+        };
+        let params = make_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            !result.conditions[0].contains("::date"),
+            "Int filter should not cast column to date, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    // ========================================
+    // with_column_cast Override Tests
+    // ========================================
+
+    #[test]
+    fn test_with_column_cast_overrides_filter_value_inference() {
+        // Without override: numeric value "123" would be inferred as Int -> ::bigint
+        // With override to String: no cast should be applied
+        let filter = Filter {
+            field: "optional_amount".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(123),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_column_cast("optional_amount", FieldType::String)
+            .with_filters(&params)
+            .build();
+
+        // String type has no cast, so ::bigint should NOT be present
+        assert!(
+            !result.conditions[0].contains("::bigint"),
+            "with_column_cast(String) should prevent bigint cast, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_with_column_cast_overrides_to_specific_type() {
+        // Override to Float should produce ::float8 cast
+        let filter = Filter {
+            field: "optional_amount".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(100),
+        };
+        let params = make_option_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_column_cast("optional_amount", FieldType::Float)
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("::float8"),
+            "with_column_cast(Float) should produce ::float8 cast, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_with_column_cast_overrides_virtual_column() {
+        // Virtual column has default FieldType::String
+        // with_column_cast should override it
+        let filter = Filter {
+            field: "computed_field".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(42),
+        };
+        let params: QueryParams<TestModelWithOptions> = QueryParams {
+            filters: vec![filter],
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_virtual_column("computed_field", |_vc| {
+                "some_expression"
+            })
+            .with_column_cast("computed_field", FieldType::Int)
+            .with_filters(&params)
+            .build();
+
+        // Should have ::bigint from the override, not default String (no cast)
+        assert!(
+            result.conditions[0].contains("::bigint"),
+            "with_column_cast should override virtual_column type, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_with_column_cast_multiple_columns() {
+        let filter1 = Filter {
+            field: "optional_amount".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(100),
+        };
+        let filter2 = Filter {
+            field: "optional_date".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(20251222),
+        };
+        let params: QueryParams<TestModelWithOptions> = QueryParams {
+            filters: vec![filter1, filter2],
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
+            .with_column_cast("optional_amount", FieldType::Float)
+            .with_column_cast("optional_date", FieldType::String)
+            .with_filters(&params)
+            .build();
+
+        // First filter should have ::float8
+        assert!(
+            result.conditions[0].contains("::float8"),
+            "optional_amount should have ::float8, got: {}",
+            result.conditions[0]
+        );
+        // Second filter should have no cast (String)
+        assert!(
+            !result.conditions[1].contains("::bigint"),
+            "optional_date should not have ::bigint, got: {}",
+            result.conditions[1]
+        );
+    }
+
+    #[test]
+    fn test_with_column_cast_does_not_affect_other_columns() {
+        // Override one column, other columns should still use normal inference
+        let filter1 = Filter {
+            field: "id".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(123),
+        };
+        let filter2 = Filter {
+            field: "name".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::String("test".to_string()),
+        };
+        let params: QueryParams<TestModel> = QueryParams {
+            filters: vec![filter1, filter2],
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_column_cast("name", FieldType::Uuid)  // Override name to Uuid
+            .with_filters(&params)
+            .build();
+
+        // id should still have ::bigint (from struct inference)
+        assert!(
+            result.conditions[0].contains("::bigint"),
+            "id should still have ::bigint, got: {}",
+            result.conditions[0]
+        );
+        // name should now have ::uuid (from override)
+        assert!(
+            result.conditions[1].contains("::uuid"),
+            "name should have ::uuid from override, got: {}",
+            result.conditions[1]
         );
     }
 }

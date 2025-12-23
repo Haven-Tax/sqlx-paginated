@@ -1,11 +1,12 @@
 use crate::paginated_query_as::internal::{
-    get_struct_field_meta, QueryPaginationParams, QuerySearchParams, QuerySortParams,
-    DEFAULT_PAGE,
+    get_struct_field_meta, FilterParseError, QueryPaginationParams, QuerySearchParams,
+    QuerySortParams,
 };
 use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue, QuerySortDirection};
 use crate::QueryParams;
 use serde::Serialize;
 
+#[derive(Debug)]
 pub struct QueryParamsBuilder<'q, T> {
     query: QueryParams<'q, T>,
 }
@@ -20,8 +21,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     /// Creates a new `QueryParamsBuilder` with default values.
     ///
     /// Default values include:
-    /// - Page: 1
-    /// - Page size: 10
+    /// - Pagination: None (no LIMIT/OFFSET)
     /// - Sort column: "created_at"
     /// - Sort direction: Descending
     ///
@@ -47,8 +47,13 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///
     /// # Arguments
     ///
-    /// * `page` - Page number (1-indexed)
-    /// * `page_size` - Number of items per page
+    /// * `page` - Page number (1-indexed, must be > 0)
+    /// * `page_size` - Number of items per page (must be > 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns `FilterParseError::InvalidPageNumber` if page < 1.
+    /// Returns `FilterParseError::InvalidPageSize` if page_size < 1.
     ///
     /// # Examples
     ///
@@ -61,13 +66,44 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///     name: String
     /// }
     /// let builder = QueryParamsBuilder::<UserExample>::new()
-    ///     .with_pagination(1, 20);
+    ///     .with_pagination(1, 20)
+    ///     .expect("valid pagination");
     /// ```
-    pub fn with_pagination(mut self, page: i64, page_size: i64) -> Self {
-        self.query.pagination = QueryPaginationParams {
-            page: page.max(DEFAULT_PAGE),
-            page_size,
-        };
+    pub fn with_pagination(mut self, page: i64, page_size: i64) -> Result<Self, FilterParseError> {
+        if page < 1 {
+            return Err(FilterParseError::InvalidPageNumber {
+                value: page.to_string(),
+            });
+        }
+        if page_size < 1 {
+            return Err(FilterParseError::InvalidPageSize {
+                value: page_size.to_string(),
+            });
+        }
+        self.query.pagination = Some(QueryPaginationParams { page, page_size });
+        Ok(self)
+    }
+
+    /// Explicitly disables pagination (returns all results without LIMIT/OFFSET).
+    ///
+    /// This is the default state, but can be useful to explicitly clear pagination
+    /// that was previously set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use serde::{Serialize};
+    /// use sqlx_paginated::{QueryParamsBuilder};
+    ///
+    /// #[derive(Serialize, Default)]
+    /// struct UserExample {
+    ///     name: String
+    /// }
+    /// let builder = QueryParamsBuilder::<UserExample>::new()
+    ///     .without_pagination();
+    /// ```
+    pub fn without_pagination(mut self) -> Self {
+        self.query.pagination = None;
         self
     }
 
@@ -285,6 +321,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///
     /// let params = QueryParamsBuilder::<UserExample>::new()
     ///     .with_pagination(1, 20)
+    ///     .expect("valid pagination")
     ///     .with_sort("created_at", QuerySortDirection::Descending)
     ///     .with_search("john", vec!["name", "email"])
     ///     .with_filter("status", FilterOperator::Eq, FilterValue::String("active".to_string()))
@@ -299,7 +336,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
 mod tests {
     use super::*;
     use crate::paginated_query_as::internal::{
-        DEFAULT_MIN_PAGE_SIZE, DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
+        DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
     };
 
     #[derive(Debug, Default, Serialize)]
@@ -312,18 +349,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pagination_defaults() {
+    fn test_pagination_defaults_to_none() {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
-        assert_eq!(
-            params.pagination.page_size, DEFAULT_MIN_PAGE_SIZE,
-            "Default page size should be {}",
-            DEFAULT_MIN_PAGE_SIZE
-        );
-        assert_eq!(
-            params.pagination.page, DEFAULT_PAGE,
-            "Default page should be {}",
-            DEFAULT_PAGE
+        assert!(
+            params.pagination.is_none(),
+            "Default pagination should be None"
         );
     }
 
@@ -363,8 +394,7 @@ mod tests {
     fn test_combined_defaults() {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
-        assert_eq!(params.pagination.page, DEFAULT_PAGE);
-        assert_eq!(params.pagination.page_size, DEFAULT_MIN_PAGE_SIZE);
+        assert!(params.pagination.is_none());
         assert_eq!(params.sort.sort_column, DEFAULT_SORT_COLUMN_NAME);
         assert_eq!(params.sort.sort_direction, QuerySortDirection::Descending);
         assert_eq!(
@@ -383,8 +413,7 @@ mod tests {
     fn test_empty_params() {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
-        assert_eq!(params.pagination.page, 1);
-        assert_eq!(params.pagination.page_size, 10);
+        assert!(params.pagination.is_none());
         assert_eq!(params.sort.sort_column, "created_at");
         assert!(matches!(
             params.sort.sort_direction,
@@ -396,12 +425,14 @@ mod tests {
     fn test_partial_params() {
         let params = QueryParamsBuilder::<TestModel>::new()
             .with_pagination(2, 10)
+            .unwrap()
             .with_search("test".to_string(), vec!["name".to_string()])
             .build();
 
-        assert_eq!(params.pagination.page, 2);
+        let pagination = params.pagination.unwrap();
+        assert_eq!(pagination.page, 2);
+        assert_eq!(pagination.page_size, 10);
         assert_eq!(params.search.search, Some("test".to_string()));
-        assert_eq!(params.pagination.page_size, 10);
         assert_eq!(params.sort.sort_column, "created_at");
         assert!(matches!(
             params.sort.sort_direction,
@@ -410,12 +441,47 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_params() {
+    fn test_invalid_page_returns_error() {
+        let result = QueryParamsBuilder::<TestModel>::new().with_pagination(0, 10);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            FilterParseError::InvalidPageNumber { .. }
+        ));
+    }
+
+    #[test]
+    fn test_invalid_page_size_returns_error() {
+        let result = QueryParamsBuilder::<TestModel>::new().with_pagination(1, 0);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            FilterParseError::InvalidPageSize { .. }
+        ));
+    }
+
+    #[test]
+    fn test_negative_page_returns_error() {
+        let result = QueryParamsBuilder::<TestModel>::new().with_pagination(-1, 10);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            FilterParseError::InvalidPageNumber { .. }
+        ));
+    }
+
+    #[test]
+    fn test_without_pagination() {
         let params = QueryParamsBuilder::<TestModel>::new()
-            .with_pagination(0, 0)
+            .with_pagination(2, 10)
+            .unwrap()
+            .without_pagination()
             .build();
 
-        assert_eq!(params.pagination.page, 1);
+        assert!(params.pagination.is_none());
     }
 
     #[test]
@@ -477,6 +543,7 @@ mod tests {
     fn test_full_params() {
         let params = QueryParamsBuilder::<TestModel>::new()
             .with_pagination(2, 20)
+            .unwrap()
             .with_sort("name".to_string(), QuerySortDirection::Ascending)
             .with_search(
                 "test".to_string(),
@@ -485,8 +552,9 @@ mod tests {
             .with_eq_filter("status", "active")
             .build();
 
-        assert_eq!(params.pagination.page, 2);
-        assert_eq!(params.pagination.page_size, 20);
+        let pagination = params.pagination.unwrap();
+        assert_eq!(pagination.page, 2);
+        assert_eq!(pagination.page_size, 20);
         assert_eq!(params.sort.sort_column, "name");
         assert!(matches!(
             params.sort.sort_direction,
@@ -516,12 +584,14 @@ mod tests {
     fn test_mixed_pagination() {
         let params = QueryParamsBuilder::<TestModel>::new()
             .with_pagination(2, 10)
+            .unwrap()
             .with_search("test".to_string(), vec!["title".to_string()])
             .with_eq_filter("status", "active")
             .build();
 
-        assert_eq!(params.pagination.page, 2);
-        assert_eq!(params.pagination.page_size, 10);
+        let pagination = params.pagination.unwrap();
+        assert_eq!(pagination.page, 2);
+        assert_eq!(pagination.page_size, 10);
         assert_eq!(params.search.search, Some("test".to_string()));
         assert_eq!(params.filters.len(), 1);
     }

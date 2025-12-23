@@ -1,26 +1,28 @@
+use super::FilterParseError;
 use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
-use serde::{Deserialize, Deserializer};
+use serde::{de::Error, Deserialize, Deserializer};
 use std::collections::HashMap;
 
 /// Parses a string into a FilterOperator enum variant.
-fn parse_operator(s: &str) -> Option<FilterOperator> {
+/// Returns Err with the raw operator string if invalid.
+fn parse_operator(s: &str) -> Result<FilterOperator, String> {
     match s {
-        "Eq" => Some(FilterOperator::Eq),
-        "Ne" => Some(FilterOperator::Ne),
-        "Gt" => Some(FilterOperator::Gt),
-        "Lt" => Some(FilterOperator::Lt),
-        "Gte" => Some(FilterOperator::Gte),
-        "Lte" => Some(FilterOperator::Lte),
-        "Like" => Some(FilterOperator::Like),
-        "ILike" => Some(FilterOperator::ILike),
-        "In" => Some(FilterOperator::In),
-        "NotIn" => Some(FilterOperator::NotIn),
-        "IsNull" => Some(FilterOperator::IsNull),
-        "IsNotNull" => Some(FilterOperator::IsNotNull),
-        "Between" => Some(FilterOperator::Between),
-        "Contains" => Some(FilterOperator::Contains),
-        _ => None,
+        "Eq" => Ok(FilterOperator::Eq),
+        "Ne" => Ok(FilterOperator::Ne),
+        "Gt" => Ok(FilterOperator::Gt),
+        "Lt" => Ok(FilterOperator::Lt),
+        "Gte" => Ok(FilterOperator::Gte),
+        "Lte" => Ok(FilterOperator::Lte),
+        "Like" => Ok(FilterOperator::Like),
+        "ILike" => Ok(FilterOperator::ILike),
+        "In" => Ok(FilterOperator::In),
+        "NotIn" => Ok(FilterOperator::NotIn),
+        "IsNull" => Ok(FilterOperator::IsNull),
+        "IsNotNull" => Ok(FilterOperator::IsNotNull),
+        "Between" => Ok(FilterOperator::Between),
+        "Contains" => Ok(FilterOperator::Contains),
+        _ => Err(s.to_string()),
     }
 }
 
@@ -121,15 +123,19 @@ where
             continue;
         }
 
-        let (operator_str, value_str) = match raw_value.split_once(':') {
-            Some((op, val)) => (op, val),
-            None => continue,
-        };
+        let (operator_str, value_str) = raw_value.split_once(':').ok_or_else(|| {
+            D::Error::custom(FilterParseError::InvalidFilterFormat {
+                field: field.clone(),
+                raw_value: raw_value.clone(),
+            })
+        })?;
 
-        let operator = match parse_operator(operator_str) {
-            Some(op) => op,
-            None => continue,
-        };
+        let operator = parse_operator(operator_str).map_err(|raw_op| {
+            D::Error::custom(FilterParseError::InvalidOperator {
+                field: field.clone(),
+                raw_operator: raw_op,
+            })
+        })?;
 
         let value = match operator {
             FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
@@ -159,21 +165,21 @@ mod tests {
 
     #[test]
     fn test_parse_operator() {
-        assert_eq!(parse_operator("Eq"), Some(FilterOperator::Eq));
-        assert_eq!(parse_operator("Ne"), Some(FilterOperator::Ne));
-        assert_eq!(parse_operator("Gt"), Some(FilterOperator::Gt));
-        assert_eq!(parse_operator("Lt"), Some(FilterOperator::Lt));
-        assert_eq!(parse_operator("Gte"), Some(FilterOperator::Gte));
-        assert_eq!(parse_operator("Lte"), Some(FilterOperator::Lte));
-        assert_eq!(parse_operator("Like"), Some(FilterOperator::Like));
-        assert_eq!(parse_operator("ILike"), Some(FilterOperator::ILike));
-        assert_eq!(parse_operator("In"), Some(FilterOperator::In));
-        assert_eq!(parse_operator("NotIn"), Some(FilterOperator::NotIn));
-        assert_eq!(parse_operator("IsNull"), Some(FilterOperator::IsNull));
-        assert_eq!(parse_operator("IsNotNull"), Some(FilterOperator::IsNotNull));
-        assert_eq!(parse_operator("Between"), Some(FilterOperator::Between));
-        assert_eq!(parse_operator("Contains"), Some(FilterOperator::Contains));
-        assert_eq!(parse_operator("Invalid"), None);
+        assert_eq!(parse_operator("Eq"), Ok(FilterOperator::Eq));
+        assert_eq!(parse_operator("Ne"), Ok(FilterOperator::Ne));
+        assert_eq!(parse_operator("Gt"), Ok(FilterOperator::Gt));
+        assert_eq!(parse_operator("Lt"), Ok(FilterOperator::Lt));
+        assert_eq!(parse_operator("Gte"), Ok(FilterOperator::Gte));
+        assert_eq!(parse_operator("Lte"), Ok(FilterOperator::Lte));
+        assert_eq!(parse_operator("Like"), Ok(FilterOperator::Like));
+        assert_eq!(parse_operator("ILike"), Ok(FilterOperator::ILike));
+        assert_eq!(parse_operator("In"), Ok(FilterOperator::In));
+        assert_eq!(parse_operator("NotIn"), Ok(FilterOperator::NotIn));
+        assert_eq!(parse_operator("IsNull"), Ok(FilterOperator::IsNull));
+        assert_eq!(parse_operator("IsNotNull"), Ok(FilterOperator::IsNotNull));
+        assert_eq!(parse_operator("Between"), Ok(FilterOperator::Between));
+        assert_eq!(parse_operator("Contains"), Ok(FilterOperator::Contains));
+        assert_eq!(parse_operator("Invalid"), Err("Invalid".to_string()));
     }
 
     #[test]

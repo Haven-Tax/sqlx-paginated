@@ -6,6 +6,6 @@ mod models;
 mod utils;
 
 pub use builders::*;
-pub use internal::{ComputedProperty, ComputedPropertyBuilder, FieldType};
+pub use internal::{FieldType, FilterParseError, VirtualColumn, VirtualColumnBuilder};
 pub use models::*;
 pub use utils::*;

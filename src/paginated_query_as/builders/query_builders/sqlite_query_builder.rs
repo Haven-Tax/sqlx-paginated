@@ -31,9 +31,10 @@ where
             column_validation_enabled: true,
             dialect: Box::new(SqliteDialect),
             _phantom: PhantomData,
-            computed_properties: HashMap::new(),
+            virtual_columns: HashMap::new(),
             active_joins: Vec::new(),
-            table_prefix: None,
+            table_alias: "base_query".to_string(),
+            column_cast_overrides: HashMap::new(),
         }
     }
 }

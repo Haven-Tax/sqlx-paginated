@@ -30,6 +30,7 @@ pub async fn paginated_query_builder_advanced_example(
     let initial_params = QueryParamsBuilder::<UserExample>::new()
         .with_search("john", vec!["name", "email"])
         .with_pagination(1, 10)
+        .expect("valid pagination")
         .with_eq_filter("status", "active")
         .with_filters(some_extra_filters)
         .with_sort("created_at", QuerySortDirection::Descending)

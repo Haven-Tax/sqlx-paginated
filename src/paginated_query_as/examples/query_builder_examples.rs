@@ -15,7 +15,6 @@ pub mod postgres_examples {
         T: Default + Serialize + 'static,
     {
         QueryBuilder::<T, Postgres>::new()
-            .with_table_prefix("base_query")
             .with_search(params)
             .with_filters(params)
             .disable_protection()
@@ -30,7 +29,6 @@ pub mod postgres_examples {
         T: Default + Serialize + 'static,
     {
         QueryBuilder::<T, Postgres>::new()
-            .with_table_prefix("base_query")
             .with_search(params)
             .with_filters(params)
             .build()

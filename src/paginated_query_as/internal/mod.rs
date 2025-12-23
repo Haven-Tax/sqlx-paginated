@@ -8,7 +8,9 @@ mod protection;
 pub use const_internal::*;
 pub use dialects::query_dialect::*;
 pub use internal_utils::*;
-pub use models_internal::*;
+pub use models_internal::{
+    QueryPaginationParams, QuerySearchParams, QuerySortParams, VirtualColumn, VirtualColumnBuilder,
+};
 pub use protection::*;
 
 pub use deserializers::*;

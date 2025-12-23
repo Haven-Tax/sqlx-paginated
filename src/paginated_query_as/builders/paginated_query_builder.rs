@@ -2,7 +2,7 @@ use crate::paginated_query_as::builders::QueryBuildResult;
 use crate::paginated_query_as::examples::postgres_examples::build_query_with_safe_defaults;
 use crate::paginated_query_as::internal::quote_identifier;
 use crate::paginated_query_as::models::QuerySortDirection;
-use crate::{FlatQueryParams, PaginatedResponse, QueryParams};
+use crate::{PaginatedResponse, QueryParams};
 use serde::Serialize;
 use sqlx::{postgres::Postgres, query::QueryAs, Execute, FromRow, IntoArguments, Pool};
 
@@ -67,7 +67,7 @@ where
     pub fn new(query: QueryAs<'q, Postgres, T, A>) -> Self {
         Self {
             query,
-            params: FlatQueryParams::default().into(),
+            params: QueryParams::default(),
             totals_count_enabled: true,
             build_query_fn: |params| build_query_with_safe_defaults::<T>(params),
         }
@@ -129,7 +129,6 @@ where
 
         let (total, total_pages, pagination) = if self.totals_count_enabled {
             let count_result = (self.build_query_fn)(&self.params);
-            let pagination_arguments = self.params.pagination.clone();
 
             let count_sql = format!(
                 "{} SELECT COUNT(*) FROM base_query{}{}",
@@ -139,23 +138,26 @@ where
                 .fetch_one(pool)
                 .await?;
 
-            let available_pages = match count {
-                0 => 0,
-                _ => (count + pagination_arguments.page_size - 1) / pagination_arguments.page_size,
-            };
-
-            (
-                Some(count),
-                Some(available_pages),
-                Some(pagination_arguments),
-            )
+            match &self.params.pagination {
+                Some(p) => {
+                    let available_pages = if count == 0 {
+                        0
+                    } else {
+                        (count + p.page_size - 1) / p.page_size
+                    };
+                    (Some(count), Some(available_pages), Some(p.clone()))
+                }
+                None => (Some(count), None, None),
+            }
         } else {
             (None, None, None)
         };
 
+        let select_target = format!("{}.*", quote_identifier(&main_result.table_alias));
+        
         let mut main_sql = format!(
-            "{} SELECT * FROM base_query{}{}",
-            base_sql, join_clause, where_clause
+            "{} SELECT {} FROM base_query{}{}",
+            base_sql, select_target, join_clause, where_clause
         );
 
         main_sql.push_str(&self.build_order_clause());
@@ -242,9 +244,51 @@ where
     }
 
     fn build_limit_offset_clause(&self) -> String {
-        let pagination = &self.params.pagination;
-        let offset = (pagination.page - 1) * pagination.page_size;
+        match &self.params.pagination {
+            Some(p) => {
+                let offset = (p.page - 1) * p.page_size;
+                format!(" LIMIT {} OFFSET {}", p.page_size, offset)
+            }
+            None => String::new(),
+        }
+    }
+}
 
-        format!(" LIMIT {} OFFSET {}", pagination.page_size, offset)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paginated_query_as::builders::QueryBuilder;
+    use serde::Serialize;
+
+    #[derive(Default, Serialize, sqlx::FromRow)]
+    struct TestModel {
+        id: i64,
+        name: String,
+        created_at: String,
+    }
+
+    #[test]
+    fn test_table_alias_in_select_clause() {
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_table_alias("base_query")
+            .build();
+        
+        assert_eq!(result.table_alias, "base_query");
+    }
+
+    #[test]
+    fn test_default_table_alias() {
+        let result = QueryBuilder::<TestModel, Postgres>::new().build();
+        
+        assert_eq!(result.table_alias, "base_query");
+    }
+
+    #[test]
+    fn test_custom_table_alias() {
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_table_alias("custom_cte")
+            .build();
+        
+        assert_eq!(result.table_alias, "custom_cte");
     }
 }

@@ -1,5 +1,7 @@
 pub static DEFAULT_SEPARATOR: &str = " ";
+#[allow(dead_code)]
 pub static DEFAULT_MIN_PAGE_SIZE: i64 = 10;
+#[allow(dead_code)]
 pub static DEFAULT_PAGE: i64 = 1;
 pub static DEFAULT_MAX_FIELD_LENGTH: i64 = 100;
 pub static DEFAULT_SEARCH_COLUMN_NAMES: [&str; 2] = ["name", "description"];

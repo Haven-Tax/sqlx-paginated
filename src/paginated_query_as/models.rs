@@ -1,10 +1,11 @@
 use crate::paginated_query_as::internal::{
-    filters_deserialize, QueryPaginationParams, QuerySearchParams, QuerySortParams,
+    filters_deserialize, page_deserialize, page_size_deserialize, FilterParseError,
+    QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 pub struct PaginatedResponse<T> {
     pub records: Vec<T>,
 
@@ -18,10 +19,15 @@ pub struct PaginatedResponse<T> {
     pub total_pages: Option<i64>,
 }
 
+/// Query parameters for paginated queries, deserialized from query strings.
+///
+/// Use `TryInto<QueryParams>` to convert this to `QueryParams` with validation.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct FlatQueryParams {
-    #[serde(flatten)]
-    pub pagination: Option<QueryPaginationParams>,
+    #[serde(default, deserialize_with = "page_deserialize")]
+    pub page: Option<i64>,
+    #[serde(default, deserialize_with = "page_size_deserialize")]
+    pub page_size: Option<i64>,
     #[serde(flatten)]
     pub sort: Option<QuerySortParams>,
     #[serde(flatten)]
@@ -130,24 +136,56 @@ pub struct Filter {
     pub value: FilterValue,
 }
 
-#[derive(Default, Clone)]
+/// Validated query parameters for paginated queries.
+///
+/// Created from `FlatQueryParams` via `TryFrom`/`TryInto`.
+#[derive(Clone, Debug)]
 pub struct QueryParams<'q, T> {
-    pub pagination: QueryPaginationParams,
+    pub pagination: Option<QueryPaginationParams>,
     pub sort: QuerySortParams,
     pub search: QuerySearchParams,
     pub filters: Vec<Filter>,
     pub(crate) _phantom: PhantomData<&'q T>,
 }
 
-impl<'q, T> From<FlatQueryParams> for QueryParams<'q, T> {
-    fn from(params: FlatQueryParams) -> Self {
-        QueryParams {
-            pagination: params.pagination.unwrap_or_default(),
+impl<'q, T> Default for QueryParams<'q, T> {
+    fn default() -> Self {
+        Self {
+            pagination: None,
+            sort: QuerySortParams::default(),
+            search: QuerySearchParams::default(),
+            filters: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<'q, T> TryFrom<FlatQueryParams> for QueryParams<'q, T> {
+    type Error = FilterParseError;
+
+    fn try_from(params: FlatQueryParams) -> Result<Self, Self::Error> {
+        let pagination = match (params.page, params.page_size) {
+            (None, None) => None,
+            (Some(page), Some(page_size)) => Some(QueryPaginationParams { page, page_size }),
+            (Some(_), None) => {
+                return Err(FilterParseError::IncompletePagination {
+                    provided: "page".to_string(),
+                })
+            }
+            (None, Some(_)) => {
+                return Err(FilterParseError::IncompletePagination {
+                    provided: "page_size".to_string(),
+                })
+            }
+        };
+
+        Ok(QueryParams {
+            pagination,
             sort: params.sort.unwrap_or_default(),
             search: params.search.unwrap_or_default(),
             filters: params.filters.unwrap_or_default(),
-            _phantom: PhantomData::<&'q T>,
-        }
+            _phantom: PhantomData,
+        })
     }
 }
 
