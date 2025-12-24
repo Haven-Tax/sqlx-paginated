@@ -2,7 +2,7 @@ use crate::paginated_query_as::internal::{
     ColumnProtection, FieldType, QueryDialect, VirtualColumn, VirtualColumnBuilder,
 };
 use crate::paginated_query_as::models::FilterOperator;
-use crate::QueryParams;
+use crate::{FilterValue, QueryParams};
 use serde::Serialize;
 use sqlx::{Arguments, Database, Encode, Type};
 use std::collections::HashMap;
@@ -440,16 +440,26 @@ where
 
             let condition = match filter.operator {
                 FilterOperator::Eq => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} = {}{}", column_expr, placeholder, type_cast)
+                    if let FilterValue::Bool(b) = filter.value {
+                        let bool_literal = if b { "TRUE" } else { "FALSE" };
+                        format!("{} IS {}", column_expr, bool_literal)
+                    } else {
+                        let value = filter.value.to_bindable_string();
+                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                        self.arguments.add(value).unwrap_or_default();
+                        format!("{} = {}{}", column_expr, placeholder, type_cast)
+                    }
                 }
                 FilterOperator::Ne => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} != {}{}", column_expr, placeholder, type_cast)
+                    if let FilterValue::Bool(b) = filter.value {
+                        let bool_literal = if b { "TRUE" } else { "FALSE" };
+                        format!("{} IS NOT {}", column_expr, bool_literal)
+                    } else {
+                        let value = filter.value.to_bindable_string();
+                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                        self.arguments.add(value).unwrap_or_default();
+                        format!("{} <> {}{}", column_expr, placeholder, type_cast)
+                    }
                 }
                 FilterOperator::Gt => {
                     let value = filter.value.to_bindable_string();
@@ -877,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_filter_bool_generates_boolean_cast() {
+    fn test_eq_filter_bool_true_generates_is_true() {
         let filter = Filter {
             field: "is_active".to_string(),
             operator: FilterOperator::Eq,
@@ -889,10 +899,169 @@ mod tests {
             .with_filters(&params)
             .build();
 
+        // Boolean Eq uses IS TRUE/FALSE syntax for proper NULL handling
         assert!(
-            result.conditions[0].contains("::boolean"),
-            "Expected ::boolean cast, got: {}",
+            result.conditions[0].contains("IS TRUE"),
+            "Expected IS TRUE for boolean Eq filter, got: {}",
             result.conditions[0]
+        );
+        // Should NOT add a placeholder argument for boolean
+        assert!(
+            !result.conditions[0].contains("$"),
+            "Boolean Eq should not use placeholder, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_eq_filter_bool_false_generates_is_false() {
+        let filter = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Bool(false),
+        };
+        let params = make_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("IS FALSE"),
+            "Expected IS FALSE for boolean Eq filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_ne_filter_bool_true_generates_is_not_true() {
+        let filter = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Ne,
+            value: FilterValue::Bool(true),
+        };
+        let params = make_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("IS NOT TRUE"),
+            "Expected IS NOT TRUE for boolean Ne filter, got: {}",
+            result.conditions[0]
+        );
+        // Should NOT add a placeholder argument for boolean
+        assert!(
+            !result.conditions[0].contains("$"),
+            "Boolean Ne should not use placeholder, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_ne_filter_bool_false_generates_is_not_false() {
+        let filter = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Ne,
+            value: FilterValue::Bool(false),
+        };
+        let params = make_params_with_filter(filter);
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert!(
+            result.conditions[0].contains("IS NOT FALSE"),
+            "Expected IS NOT FALSE for boolean Ne filter, got: {}",
+            result.conditions[0]
+        );
+    }
+
+    #[test]
+    fn test_bool_filter_does_not_consume_argument_slot() {
+        // Verify that boolean filters don't add arguments, so subsequent filters
+        // get correct placeholder numbers
+        let filter1 = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Bool(true),
+        };
+        let filter2 = Filter {
+            field: "id".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(123),
+        };
+        let params: QueryParams<TestModel> = QueryParams {
+            filters: vec![filter1, filter2],
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        // First condition should be IS TRUE (no placeholder)
+        assert!(
+            result.conditions[0].contains("IS TRUE"),
+            "First condition should be IS TRUE, got: {}",
+            result.conditions[0]
+        );
+        // Second condition should use $1 (not $2) since boolean didn't consume a slot
+        assert!(
+            result.conditions[1].contains("$1"),
+            "Second condition should use $1 since boolean didn't consume argument slot, got: {}",
+            result.conditions[1]
+        );
+        // Only one argument should be in the arguments list
+        assert_eq!(
+            result.arguments.len(),
+            1,
+            "Expected 1 argument (only for int filter), got {}",
+            result.arguments.len()
+        );
+    }
+
+    #[test]
+    fn test_multiple_bool_filters_dont_affect_argument_count() {
+        let filter1 = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Bool(true),
+        };
+        let filter2 = Filter {
+            field: "is_active".to_string(),
+            operator: FilterOperator::Ne,
+            value: FilterValue::Bool(false),
+        };
+        let filter3 = Filter {
+            field: "name".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::String("test".to_string()),
+        };
+        let params: QueryParams<TestModel> = QueryParams {
+            filters: vec![filter1, filter2, filter3],
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        // Two boolean filters should not add arguments
+        // String filter should use $1
+        assert!(result.conditions[0].contains("IS TRUE"));
+        assert!(result.conditions[1].contains("IS NOT FALSE"));
+        assert!(
+            result.conditions[2].contains("$1"),
+            "String filter should use $1, got: {}",
+            result.conditions[2]
+        );
+        assert_eq!(
+            result.arguments.len(),
+            1,
+            "Expected 1 argument (only for string filter)"
         );
     }
 
@@ -1175,8 +1344,8 @@ mod tests {
             .build();
 
         assert!(
-            result.conditions[0].contains("::date !="),
-            "Expected column::date != for Date filter, got: {}",
+            result.conditions[0].contains("::date <>"),
+            "Expected column::date <> for Date filter, got: {}",
             result.conditions[0]
         );
     }

@@ -258,16 +258,16 @@ mod tests {
 
     #[test]
     fn test_parse_filter_value_datetime() {
-        // RFC 3339 with timezone
+        // RFC 3339 with timezone - converted to UTC string format
         assert_eq!(
             parse_filter_value("2025-12-02T10:30:00Z"),
-            FilterValue::DateTime("2025-12-02T10:30:00Z".to_string())
+            FilterValue::DateTime("2025-12-02 10:30:00 UTC".to_string())
         );
         assert_eq!(
             parse_filter_value("2025-12-02T10:30:00+00:00"),
-            FilterValue::DateTime("2025-12-02T10:30:00+00:00".to_string())
+            FilterValue::DateTime("2025-12-02 10:30:00 UTC".to_string())
         );
-        // Naive datetime without timezone
+        // Naive datetime without timezone - preserved as-is
         assert_eq!(
             parse_filter_value("2025-12-02T10:30:00"),
             FilterValue::DateTime("2025-12-02T10:30:00".to_string())
@@ -275,6 +275,37 @@ mod tests {
         assert_eq!(
             parse_filter_value("2025-12-02 10:30:00"),
             FilterValue::DateTime("2025-12-02 10:30:00".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_value_datetime_timezone_conversion() {
+        // Positive offset: +05:30 means 5 hours 30 minutes ahead of UTC
+        // 10:30:00+05:30 -> 05:00:00 UTC
+        assert_eq!(
+            parse_filter_value("2025-12-02T10:30:00+05:30"),
+            FilterValue::DateTime("2025-12-02 05:00:00 UTC".to_string())
+        );
+
+        // Negative offset: -05:00 means 5 hours behind UTC
+        // 10:30:00-05:00 -> 15:30:00 UTC
+        assert_eq!(
+            parse_filter_value("2025-12-02T10:30:00-05:00"),
+            FilterValue::DateTime("2025-12-02 15:30:00 UTC".to_string())
+        );
+
+        // Edge case: crossing date boundary
+        // 02:00:00+05:00 on Dec 2 -> 21:00:00 UTC on Dec 1
+        assert_eq!(
+            parse_filter_value("2025-12-02T02:00:00+05:00"),
+            FilterValue::DateTime("2025-12-01 21:00:00 UTC".to_string())
+        );
+
+        // Edge case: crossing date boundary the other way
+        // 23:00:00-05:00 on Dec 2 -> 04:00:00 UTC on Dec 3
+        assert_eq!(
+            parse_filter_value("2025-12-02T23:00:00-05:00"),
+            FilterValue::DateTime("2025-12-03 04:00:00 UTC".to_string())
         );
     }
 
