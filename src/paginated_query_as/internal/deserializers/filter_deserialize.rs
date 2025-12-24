@@ -47,8 +47,8 @@ fn parse_filter_value(s: &str) -> FilterValue {
 
     // Try DateTime (RFC 3339 / ISO 8601 with timezone)
     // Examples: 2025-12-02T10:30:00Z, 2025-12-02T10:30:00+00:00
-    if DateTime::<FixedOffset>::parse_from_rfc3339(s).is_ok() {
-        return FilterValue::DateTime(s.to_string());
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
+        return FilterValue::DateTime(dt.to_utc().to_string());
     }
 
     // Try NaiveDateTime (ISO 8601 without timezone)
