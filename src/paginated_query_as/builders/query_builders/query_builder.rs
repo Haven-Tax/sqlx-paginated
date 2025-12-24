@@ -315,6 +315,8 @@ where
 
                             let mapper = self.mappers.get(column);
 
+                            // Mappers allow for custom column names and types added by the developer
+                            // For these we're skipping column validation
                             if mapper.is_none() && !self.is_column_safe(column) {
                                 return None;
                             }
