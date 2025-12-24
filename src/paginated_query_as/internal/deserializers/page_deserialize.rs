@@ -1,27 +1,31 @@
-use crate::paginated_query_as::internal::{extract_digits_from_strings, DEFAULT_PAGE};
-use serde::{Deserialize, Deserializer};
+use super::FilterParseError;
+use serde::{de::Error, Deserialize, Deserializer};
 
-pub fn page_deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+/// Deserializes a page number from query parameters.
+///
+/// Returns:
+/// - `Ok(None)` if the value is `None` or empty (pagination not requested)
+/// - `Ok(Some(n))` if the value is a valid positive integer
+/// - `Err(FilterParseError::InvalidPageNumber)` if the value is invalid
+pub fn page_deserialize<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Option::<String>::deserialize(deserializer)?;
-    let value_with_fallbacks = match value {
-        None => return Ok(DEFAULT_PAGE),
-        Some(s) if s.trim().is_empty() || s.trim().starts_with('-') => return Ok(DEFAULT_PAGE),
-        Some(s) => extract_digits_from_strings(s),
-    };
 
-    value_with_fallbacks
-        .parse::<i64>()
-        .map(|digit| {
-            if digit < DEFAULT_PAGE {
-                DEFAULT_PAGE
-            } else {
-                digit
+    match value {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            match trimmed.parse::<i64>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => Err(D::Error::custom(FilterParseError::InvalidPageNumber {
+                    value: s,
+                })),
             }
-        })
-        .or(Ok(DEFAULT_PAGE))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -38,37 +42,63 @@ mod tests {
     }
 
     #[test]
-    fn test_page_deserialize() {
-        // Default cases
-        assert_eq!(
-            deserialize_test(r#"null"#, page_deserialize).unwrap(),
-            DEFAULT_PAGE
-        );
-        assert_eq!(
-            deserialize_test(r#""""#, page_deserialize).unwrap(),
-            DEFAULT_PAGE
-        );
+    fn test_page_deserialize_none() {
+        assert_eq!(deserialize_test(r#"null"#, page_deserialize).unwrap(), None);
+    }
 
-        // Valid cases
-        assert_eq!(deserialize_test(r#""2""#, page_deserialize).unwrap(), 2);
-        assert_eq!(deserialize_test(r#""10""#, page_deserialize).unwrap(), 10);
+    #[test]
+    fn test_page_deserialize_empty() {
+        assert_eq!(deserialize_test(r#""""#, page_deserialize).unwrap(), None);
+        assert_eq!(
+            deserialize_test(r#""  ""#, page_deserialize).unwrap(),
+            None
+        );
+    }
 
-        // Invalid/Edge cases
+    #[test]
+    fn test_page_deserialize_valid() {
         assert_eq!(
-            deserialize_test(r#""0""#, page_deserialize).unwrap(),
-            DEFAULT_PAGE
+            deserialize_test(r#""1""#, page_deserialize).unwrap(),
+            Some(1)
         );
         assert_eq!(
-            deserialize_test(r#""-1""#, page_deserialize).unwrap(),
-            DEFAULT_PAGE
+            deserialize_test(r#""2""#, page_deserialize).unwrap(),
+            Some(2)
         );
         assert_eq!(
-            deserialize_test(r#""abc123""#, page_deserialize).unwrap(),
-            123
+            deserialize_test(r#""10""#, page_deserialize).unwrap(),
+            Some(10)
         );
         assert_eq!(
-            deserialize_test(r#""page 5""#, page_deserialize).unwrap(),
-            5
+            deserialize_test(r#""100""#, page_deserialize).unwrap(),
+            Some(100)
         );
+    }
+
+    #[test]
+    fn test_page_deserialize_zero_is_invalid() {
+        let result = deserialize_test(r#""0""#, page_deserialize);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_deserialize_negative_is_invalid() {
+        let result = deserialize_test(r#""-1""#, page_deserialize);
+        assert!(result.is_err());
+
+        let result = deserialize_test(r#""-100""#, page_deserialize);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_deserialize_non_numeric_is_invalid() {
+        let result = deserialize_test(r#""abc""#, page_deserialize);
+        assert!(result.is_err());
+
+        let result = deserialize_test(r#""page 5""#, page_deserialize);
+        assert!(result.is_err());
+
+        let result = deserialize_test(r#""abc123""#, page_deserialize);
+        assert!(result.is_err());
     }
 }

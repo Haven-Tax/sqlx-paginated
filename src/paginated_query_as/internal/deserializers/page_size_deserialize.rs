@@ -1,24 +1,31 @@
-use crate::paginated_query_as::internal::{
-    extract_digits_from_strings, DEFAULT_MIN_PAGE_SIZE,
-};
-use serde::{Deserialize, Deserializer};
+use super::FilterParseError;
+use serde::{de::Error, Deserialize, Deserializer};
 
-pub fn page_size_deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+/// Deserializes a page size from query parameters.
+///
+/// Returns:
+/// - `Ok(None)` if the value is `None` or empty (pagination not requested)
+/// - `Ok(Some(n))` if the value is a valid positive integer
+/// - `Err(FilterParseError::InvalidPageSize)` if the value is invalid
+pub fn page_size_deserialize<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Option::<String>::deserialize(deserializer)?;
-    let value_with_fallbacks = match value {
-        None => return Ok(DEFAULT_MIN_PAGE_SIZE),
-        Some(s) if s.trim().is_empty() || s.trim().starts_with('-') => {
-            return Ok(DEFAULT_MIN_PAGE_SIZE)
-        }
-        Some(s) => extract_digits_from_strings(s),
-    };
 
-    value_with_fallbacks
-        .parse::<i64>()
-        .or(Ok(DEFAULT_MIN_PAGE_SIZE))
+    match value {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            match trimmed.parse::<i64>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => Err(D::Error::custom(FilterParseError::InvalidPageSize {
+                    value: s,
+                })),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -35,41 +42,66 @@ mod tests {
     }
 
     #[test]
-    fn test_page_size_deserialize() {
-        // Default cases
+    fn test_page_size_deserialize_none() {
         assert_eq!(
             deserialize_test(r#"null"#, page_size_deserialize).unwrap(),
-            DEFAULT_MIN_PAGE_SIZE
+            None
         );
+    }
+
+    #[test]
+    fn test_page_size_deserialize_empty() {
         assert_eq!(
             deserialize_test(r#""""#, page_size_deserialize).unwrap(),
-            DEFAULT_MIN_PAGE_SIZE
+            None
         );
+        assert_eq!(
+            deserialize_test(r#""  ""#, page_size_deserialize).unwrap(),
+            None
+        );
+    }
 
-        // Valid cases
+    #[test]
+    fn test_page_size_deserialize_valid() {
+        assert_eq!(
+            deserialize_test(r#""1""#, page_size_deserialize).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            deserialize_test(r#""10""#, page_size_deserialize).unwrap(),
+            Some(10)
+        );
         assert_eq!(
             deserialize_test(r#""20""#, page_size_deserialize).unwrap(),
-            20
-        );
-
-        // Clamping cases
-        assert_eq!(
-            deserialize_test(r#""5""#, page_size_deserialize).unwrap(),
-            DEFAULT_MIN_PAGE_SIZE
+            Some(20)
         );
         assert_eq!(
             deserialize_test(r#""100""#, page_size_deserialize).unwrap(),
-            DEFAULT_MAX_PAGE_SIZE
+            Some(100)
         );
+    }
 
-        // Invalid/Edge cases
-        assert_eq!(
-            deserialize_test(r#""size25""#, page_size_deserialize).unwrap(),
-            25
-        );
-        assert_eq!(
-            deserialize_test(r#""-50""#, page_size_deserialize).unwrap(),
-            DEFAULT_MIN_PAGE_SIZE
-        );
+    #[test]
+    fn test_page_size_deserialize_zero_is_invalid() {
+        let result = deserialize_test(r#""0""#, page_size_deserialize);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_size_deserialize_negative_is_invalid() {
+        let result = deserialize_test(r#""-1""#, page_size_deserialize);
+        assert!(result.is_err());
+
+        let result = deserialize_test(r#""-50""#, page_size_deserialize);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_page_size_deserialize_non_numeric_is_invalid() {
+        let result = deserialize_test(r#""abc""#, page_size_deserialize);
+        assert!(result.is_err());
+
+        let result = deserialize_test(r#""size25""#, page_size_deserialize);
+        assert!(result.is_err());
     }
 }
