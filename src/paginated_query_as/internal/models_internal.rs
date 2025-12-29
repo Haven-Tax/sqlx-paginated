@@ -1,32 +1,19 @@
 use crate::paginated_query_as::internal::{
-    default_date_range_column, default_page, default_page_size, default_search_columns,
-    default_sort_column, default_sort_direction, page_deserialize, page_size_deserialize,
+    default_search_columns, default_sort_column, default_sort_direction,
     search_columns_deserialize, search_deserialize,
 };
 
 use crate::QuerySortDirection;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "snake_case")]
+/// Pagination parameters for queries.
+///
+/// This struct is only created when both `page` and `page_size` are provided.
+/// If neither is provided, pagination is disabled (no LIMIT/OFFSET).
+#[derive(Serialize, Clone, Debug)]
 pub struct QueryPaginationParams {
-    #[serde(deserialize_with = "page_deserialize", default = "default_page")]
     pub page: i64,
-    #[serde(
-        deserialize_with = "page_size_deserialize",
-        default = "default_page_size"
-    )]
     pub page_size: i64,
-}
-
-impl Default for QueryPaginationParams {
-    fn default() -> Self {
-        Self {
-            page: default_page(),
-            page_size: default_page_size(),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -68,21 +55,73 @@ impl Default for QuerySearchParams {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "snake_case")]
-pub struct QueryDateRangeParams {
-    pub date_after: Option<DateTime<Utc>>,
-    pub date_before: Option<DateTime<Utc>>,
-    #[serde(default = "default_date_range_column")]
-    pub date_column: Option<String>,
+
+use crate::paginated_query_as::internal::internal_utils::FieldType;
+
+/// Builder for configuring a virtual column within the closure.
+///
+/// Used with `QueryBuilder::with_virtual_column()` to define virtual columns
+/// that map to SQL expressions, optionally with required JOIN clauses.
+#[derive(Debug, Clone)]
+pub struct VirtualColumnBuilder {
+    pub(crate) joins: Vec<String>,
+    pub(crate) column_type: FieldType,
 }
 
-impl Default for QueryDateRangeParams {
+impl Default for VirtualColumnBuilder {
     fn default() -> Self {
         Self {
-            date_after: None,
-            date_before: None,
-            date_column: default_date_range_column(),
+            joins: Vec::new(),
+            column_type: FieldType::String,
         }
     }
+}
+
+impl VirtualColumnBuilder {
+    /// Creates a new VirtualColumnBuilder with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a JOIN clause required for this virtual column.
+    ///
+    /// Multiple joins can be added by calling this method multiple times.
+    /// Joins are only included in the final query if the virtual column
+    /// is actually used in search or filter operations.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Used within QueryBuilder::with_virtual_column closure:
+    /// // IMPORTANT: When using with PaginatedQueryBuilder, reference "base_query" not the original table
+    /// builder.with_virtual_column("counterparty_name", |vc| {
+    ///     vc.with_join("LEFT JOIN counterparty ON counterparty.id = base_query.counterparty_id");
+    ///     "counterparty.legal_name"
+    /// })
+    /// ```
+    pub fn with_join(&mut self, clause: impl Into<String>) -> &mut Self {
+        self.joins.push(clause.into());
+        self
+    }
+
+    /// Set the column type for proper type casting in filters.
+    ///
+    /// Defaults to `FieldType::String` if not specified.
+    pub fn with_column_type(&mut self, column_type: FieldType) -> &mut Self {
+        self.column_type = column_type;
+        self
+    }
+}
+
+/// Stored virtual column definition.
+///
+/// Represents a virtual column that maps to a SQL expression,
+/// with optional JOIN clauses that are activated when the column is used.
+#[derive(Debug, Clone)]
+pub struct VirtualColumn {
+    /// The SQL expression (e.g., "counterparty.name" or "(amount_micros / 1000000)::money")
+    pub expression: String,
+    /// JOIN clauses needed for this virtual column
+    pub joins: Vec<String>,
+    /// Column type for proper type casting in filters
+    pub column_type: FieldType,
 }
