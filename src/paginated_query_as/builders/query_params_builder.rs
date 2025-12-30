@@ -1,6 +1,5 @@
 use crate::paginated_query_as::internal::{
-    get_struct_field_meta, FilterParseError, QueryPaginationParams, QuerySearchParams,
-    QuerySortParams,
+    FilterParseError, QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue, QuerySortDirection};
 use crate::QueryParams;
@@ -209,19 +208,11 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
         operator: FilterOperator,
         value: FilterValue,
     ) -> Self {
-        let field = field.into();
-        let valid_fields: Vec<String> = get_struct_field_meta::<T>().keys().cloned().collect();
-
-        if valid_fields.contains(&field) {
-            self.query.filters.push(Filter {
-                field,
-                operator,
-                value,
-            });
-        } else {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(column = %field, "Skipping invalid filter column");
-        }
+        self.query.filters.push(Filter {
+            field: field.into(),
+            operator,
+            value,
+        });
         self
     }
 
@@ -287,16 +278,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///     .build();
     /// ```
     pub fn with_filters(mut self, filters: Vec<Filter>) -> Self {
-        let valid_fields: Vec<String> = get_struct_field_meta::<T>().keys().cloned().collect();
-
-        for filter in filters {
-            if valid_fields.contains(&filter.field) {
-                self.query.filters.push(filter);
-            } else {
-                #[cfg(feature = "tracing")]
-                tracing::warn!(column = %filter.field, "Skipping invalid filter column");
-            }
-        }
+        self.query.filters.extend(filters);
         self
     }
 
@@ -597,12 +579,13 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_filter_column() {
+    fn test_filter_column_passed_through() {
         let params = QueryParamsBuilder::<TestModel>::new()
-            .with_eq_filter("invalid_column", "value")
+            .with_eq_filter("any_column", "value")
             .build();
 
-        assert!(params.filters.is_empty(), "Invalid column should be skipped");
+        assert_eq!(params.filters.len(), 1, "Filter should be passed through for QueryBuilder validation");
+        assert_eq!(params.filters[0].field, "any_column");
     }
 
     #[test]
