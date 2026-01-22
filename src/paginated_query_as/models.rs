@@ -5,6 +5,24 @@ use crate::paginated_query_as::internal::{
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
+impl From<uuid::Uuid> for FilterValue {
+    fn from(value: uuid::Uuid) -> Self {
+        FilterValue::Uuid(value)
+    }
+}
+
+impl <T: Clone + Into<FilterValue>> From<&[T]> for FilterValue {
+    fn from(value: &[T]) -> Self {
+        FilterValue::Array(value.iter().map(|v| v.clone().into()).collect())
+    }
+}
+
+impl<T: Into<FilterValue>> From<Vec<T>> for FilterValue {
+    fn from(value: Vec<T>) -> Self {
+        FilterValue::Array(value.into_iter().map(|v| v.into()).collect())
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct PaginatedResponse<T> {
     pub records: Vec<T>,
@@ -142,7 +160,7 @@ pub struct Filter {
 #[derive(Clone, Debug)]
 pub struct QueryParams<'q, T> {
     pub pagination: Option<QueryPaginationParams>,
-    pub sort: QuerySortParams,
+    pub sort: Option<QuerySortParams>,
     pub search: QuerySearchParams,
     pub filters: Vec<Filter>,
     pub(crate) _phantom: PhantomData<&'q T>,
@@ -152,7 +170,7 @@ impl<'q, T> Default for QueryParams<'q, T> {
     fn default() -> Self {
         Self {
             pagination: None,
-            sort: QuerySortParams::default(),
+            sort: None,
             search: QuerySearchParams::default(),
             filters: Vec::new(),
             _phantom: PhantomData,
@@ -181,7 +199,7 @@ impl<'q, T> TryFrom<FlatQueryParams> for QueryParams<'q, T> {
 
         Ok(QueryParams {
             pagination,
-            sort: params.sort.unwrap_or_default(),
+            sort: params.sort,
             search: params.search.unwrap_or_default(),
             filters: params.filters.unwrap_or_default(),
             _phantom: PhantomData,
@@ -195,6 +213,35 @@ pub enum QuerySortDirection {
     Ascending,
     #[default]
     Descending,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortItem {
+    Column(String),
+    Expression(String),
+}
+
+impl SortItem {
+    pub fn column(name: &str) -> Self {
+        SortItem::Column(name.to_string())
+    }
+
+    pub fn expression(expr: &str) -> Self {
+        SortItem::Expression(expr.to_string())
+    }
+
+    pub fn to_sql(&self, table_alias: &str) -> String {
+        match self {
+            SortItem::Column(col) => format!("\"{}\".\"{}\"", table_alias, col),
+            SortItem::Expression(expr) => expr.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortEntry {
+    pub item: SortItem,
+    pub direction: QuerySortDirection,
 }
 
 
