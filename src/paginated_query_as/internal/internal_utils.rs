@@ -1,7 +1,6 @@
 use crate::paginated_query_as::internal::{
-    DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
+    DEFAULT_SEARCH_COLUMN_NAMES,
 };
-use crate::QuerySortDirection;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -69,14 +68,6 @@ pub fn default_search_columns() -> Option<Vec<String>> {
     )
 }
 
-pub fn default_sort_column() -> String {
-    DEFAULT_SORT_COLUMN_NAME.to_string()
-}
-
-pub fn default_sort_direction() -> QuerySortDirection {
-    QuerySortDirection::Descending
-}
-
 pub fn quote_identifier(identifier: &str) -> String {
     identifier
         .split('.')
@@ -95,7 +86,6 @@ pub fn extract_digits_from_strings(val: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paginated_query_as::models::QuerySortDirection;
     use serde::Serialize;
 
     #[test]
@@ -107,19 +97,6 @@ mod tests {
         assert!(columns.contains(&"name".to_string()));
         assert!(columns.contains(&"description".to_string()));
         assert_eq!(columns.len(), 2);
-    }
-
-    #[test]
-    fn test_default_sort_field() {
-        assert_eq!(default_sort_column(), "created_at");
-    }
-
-    #[test]
-    fn test_default_sort_direction() {
-        assert!(matches!(
-            default_sort_direction(),
-            QuerySortDirection::Descending
-        ));
     }
 
     #[test]

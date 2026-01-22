@@ -1,7 +1,7 @@
 use crate::paginated_query_as::builders::QueryBuildResult;
 use crate::paginated_query_as::examples::postgres_examples::build_query_with_safe_defaults;
 use crate::paginated_query_as::internal::quote_identifier;
-use crate::paginated_query_as::models::QuerySortDirection;
+use crate::paginated_query_as::models::{QuerySortDirection, SortEntry};
 use crate::{PaginatedResponse, QueryParams};
 use serde::Serialize;
 use sqlx::{postgres::Postgres, query::QueryAs, Execute, FromRow, IntoArguments, Pool};
@@ -126,14 +126,68 @@ where
         let main_result = (self.build_query_fn)(&self.params);
         let join_clause = self.build_join_clause(&main_result.joins);
         let where_clause = self.build_where_clause(&main_result.conditions);
+        let group_by_clause = build_group_by_clause(&main_result.group_by_columns);
+        let outer_query = main_result.outer_query.as_ref();
+        let has_outer_conditions = outer_query.is_some_and(|oq| !oq.conditions.is_empty());
+        let outer_where_clause = outer_query
+            .map(|oq| self.build_where_clause(&oq.conditions))
+            .unwrap_or_default();
+
+        let select_target = match &main_result.select_columns {
+            Some(cols) if !cols.is_empty() => cols.join(", "),
+            _ => format!("{}.*", quote_identifier(&main_result.table_alias)),
+        };
+
+        let has_outer_aggregation = outer_query.is_some_and(|oq| !oq.group_by_columns.is_empty());
+        let outer_group_by_clause_for_count = outer_query
+            .map(|oq| build_group_by_clause_from_vec(&oq.group_by_columns))
+            .unwrap_or_default();
+        let group_by_present = main_result
+            .group_by_columns
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
 
         let (total, total_pages, pagination) = if self.totals_count_enabled {
             let count_result = (self.build_query_fn)(&self.params);
 
-            let count_sql = format!(
-                "{} SELECT COUNT(*) FROM base_query{}{}",
-                base_sql, join_clause, where_clause
-            );
+            let count_sql = match (has_outer_conditions, has_outer_aggregation, group_by_present) {
+                (true, true, _) => {
+                    let inner_select = build_inner_select(
+                        &select_target,
+                        &join_clause,
+                        &where_clause,
+                        &group_by_clause,
+                    );
+                    let outer_select = format!(
+                        "SELECT 1 FROM ({}) AS inner_query{}{}",
+                        inner_select, outer_where_clause, outer_group_by_clause_for_count
+                    );
+                    format!(
+                        "{} SELECT COUNT(*) FROM ({}) AS aggregated",
+                        base_sql, outer_select
+                    )
+                }
+                (true, false, _) => {
+                    let inner_select = build_inner_select(
+                        &select_target,
+                        &join_clause,
+                        &where_clause,
+                        &group_by_clause,
+                    );
+                    format!(
+                        "{} SELECT COUNT(*) FROM ({}) AS inner_query{}",
+                        base_sql, inner_select, outer_where_clause
+                    )
+                }
+                (false, _, true) => format!(
+                    "{} SELECT COUNT(*) FROM (SELECT 1 FROM base_query{}{}{}) AS grouped",
+                    base_sql, join_clause, where_clause, group_by_clause
+                ),
+                (false, _, false) => format!(
+                    "{} SELECT COUNT(*) FROM base_query{}{}",
+                    base_sql, join_clause, where_clause
+                ),
+            };
             let count: i64 = sqlx::query_scalar_with(&count_sql, count_result.arguments)
                 .fetch_one(pool)
                 .await?;
@@ -153,14 +207,53 @@ where
             (None, None, None)
         };
 
-        let select_target = format!("{}.*", quote_identifier(&main_result.table_alias));
-        
-        let mut main_sql = format!(
-            "{} SELECT {} FROM base_query{}{}",
-            base_sql, select_target, join_clause, where_clause
-        );
+        let distinct_clause = match &main_result.distinct_on_columns {
+            Some(cols) if !cols.is_empty() => {
+                let cols_sql = cols
+                    .iter()
+                    .map(|c| format!("{}.{}", quote_identifier(&main_result.table_alias), quote_identifier(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("DISTINCT ON ({}) ", cols_sql)
+            }
+            _ => String::new(),
+        };
 
-        main_sql.push_str(&self.build_order_clause());
+        let outer_select_target = outer_query
+            .filter(|oq| !oq.select_columns.is_empty())
+            .map(|oq| oq.select_columns.join(", "))
+            .unwrap_or_else(|| "*".to_string());
+
+        let outer_group_by_clause = outer_query
+            .map(|oq| build_group_by_clause_from_vec(&oq.group_by_columns))
+            .unwrap_or_default();
+
+        let mut main_sql = if has_outer_conditions {
+            let inner_sql = build_inner_select(
+                &format!("{}{}", distinct_clause, select_target),
+                &join_clause,
+                &where_clause,
+                &group_by_clause,
+            );
+            format!(
+                "{} SELECT {} FROM ({}) AS inner_query{}{}",
+                base_sql, outer_select_target, inner_sql, outer_where_clause, outer_group_by_clause
+            )
+        } else {
+            let mut sql = format!(
+                "{} SELECT {}{} FROM base_query{}{}",
+                base_sql, distinct_clause, select_target, join_clause, where_clause
+            );
+            sql.push_str(&group_by_clause);
+            sql
+        };
+
+        let order_table_alias = if has_outer_conditions {
+            "inner_query"
+        } else {
+            &main_result.table_alias
+        };
+        main_sql.push_str(&self.build_order_clause(&main_result.sort_entries, order_table_alias));
         main_sql.push_str(&self.build_limit_offset_clause());
 
         let records = sqlx::query_as_with::<Postgres, T, _>(&main_sql, main_result.arguments)
@@ -220,27 +313,52 @@ where
 
     /// Builds the ORDER BY clause based on sort parameters.
     ///
+    /// # Arguments
+    ///
+    /// * `sort_entries` - Explicit sort entries from the query builder (takes precedence)
+    /// * `table_alias` - The table alias to use for column references
+    ///
     /// # Returns
     ///
     /// Returns the formatted ORDER BY clause with proper column quoting.
-    /// If the column doesn't contain a '.', it's prefixed with "base_query." to avoid
-    /// ambiguity when JOINs are present.
-    fn build_order_clause(&self) -> String {
-        let order = match self.params.sort.sort_direction {
-            QuerySortDirection::Ascending => "ASC",
-            QuerySortDirection::Descending => "DESC",
-        };
-        
-        let sort_column = &self.params.sort.sort_column;
-        let column_name = if sort_column.contains('.') {
-            // Already qualified (e.g., "table.column" or "base_query.column")
-            quote_identifier(sort_column)
-        } else {
-            // Prefix with base_query to avoid ambiguity with JOINed tables
-            format!("\"base_query\".{}", quote_identifier(sort_column))
-        };
+    /// Uses sort_entries if provided, otherwise falls back to params.sort.
+    fn build_order_clause(&self, sort_entries: &[SortEntry], table_alias: &str) -> String {
+        if !sort_entries.is_empty() {
+            let order_parts: Vec<String> = sort_entries
+                .iter()
+                .map(|entry| {
+                    let direction = match entry.direction {
+                        QuerySortDirection::Ascending => "ASC",
+                        QuerySortDirection::Descending => "DESC",
+                    };
+                    format!("{} {}", entry.item.to_sql(table_alias), direction)
+                })
+                .collect();
+            return format!(" ORDER BY {}", order_parts.join(", "));
+        }
 
-        format!(" ORDER BY {} {}", column_name, order)
+        self.params
+            .sort
+            .as_ref()
+            .and_then(|sort| {
+                let sort_direction = sort.sort_direction.as_ref()?;
+                let sort_column = sort.sort_column.as_ref()?;
+                let order = match sort_direction {
+                    QuerySortDirection::Ascending => "ASC",
+                    QuerySortDirection::Descending => "DESC",
+                };
+                let column_name = if sort_column.contains('.') {
+                    quote_identifier(sort_column)
+                } else {
+                    format!(
+                        "{}.{}",
+                        quote_identifier(table_alias),
+                        quote_identifier(sort_column)
+                    )
+                };
+                Some(format!(" ORDER BY {} {}", column_name, order))
+            })
+            .unwrap_or_default()
     }
 
     fn build_limit_offset_clause(&self) -> String {
@@ -252,6 +370,34 @@ where
             None => String::new(),
         }
     }
+
+}
+
+fn build_group_by_clause(group_by_columns: &Option<Vec<String>>) -> String {
+    match group_by_columns {
+        Some(cols) if !cols.is_empty() => format!(" GROUP BY {}", cols.join(", ")),
+        _ => String::new(),
+    }
+}
+
+fn build_group_by_clause_from_vec(group_by_columns: &[String]) -> String {
+    if group_by_columns.is_empty() {
+        String::new()
+    } else {
+        format!(" GROUP BY {}", group_by_columns.join(", "))
+    }
+}
+
+fn build_inner_select(
+    select_target: &str,
+    join_clause: &str,
+    where_clause: &str,
+    group_by_clause: &str,
+) -> String {
+    format!(
+        "SELECT {} FROM base_query{}{}{}",
+        select_target, join_clause, where_clause, group_by_clause
+    )
 }
 
 #[cfg(test)]

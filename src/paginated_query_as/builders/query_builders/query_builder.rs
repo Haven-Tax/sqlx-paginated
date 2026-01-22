@@ -1,12 +1,83 @@
 use crate::paginated_query_as::internal::{
-    ColumnProtection, FieldType, QueryDialect, VirtualColumn, VirtualColumnBuilder,
+    ColumnProtection, FieldType, QueryDialect, VirtualColumn, VirtualColumnBuilder, get_struct_field_meta,
 };
-use crate::paginated_query_as::models::FilterOperator;
-use crate::{FilterValue, QueryParams};
+use crate::paginated_query_as::models::{FilterOperator, FilterValue, QueryParams, SortEntry, SortItem, QuerySortDirection};
 use serde::Serialize;
 use sqlx::{Arguments, Database, Encode, Type};
 use std::collections::HashMap;
 use std::marker::PhantomData;
+
+/// Configuration for outer query wrapping.
+///
+/// When window functions need filtering, the query is wrapped in a subquery.
+/// This struct configures the outer query's SELECT, WHERE, and GROUP BY clauses.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OuterQuery {
+    pub conditions: Vec<String>,
+    pub select_columns: Vec<String>,
+    pub group_by_columns: Vec<String>,
+}
+
+impl OuterQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true if this outer query has any configuration.
+    pub fn is_empty(&self) -> bool {
+        self.conditions.is_empty() && self.select_columns.is_empty() && self.group_by_columns.is_empty()
+    }
+}
+
+/// Builder for configuring the outer query in a callback pattern.
+///
+/// Used with `QueryBuilder::with_outer()` to configure outer query conditions,
+/// selects, and group by clauses.
+#[derive(Debug, Default)]
+pub struct OuterQueryBuilder {
+    pub(crate) conditions: Vec<String>,
+    pub(crate) select_columns: Vec<String>,
+    pub(crate) group_by_columns: Vec<String>,
+}
+
+impl OuterQueryBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a condition to the outer WHERE clause.
+    ///
+    /// Use this for filtering on window function results like RANK(), ROW_NUMBER(), etc.
+    pub fn condition(&mut self, condition: impl Into<String>) -> &mut Self {
+        self.conditions.push(condition.into());
+        self
+    }
+
+    /// Adds a column to the outer SELECT clause.
+    ///
+    /// Use this for aggregations that should be applied after filtering.
+    pub fn select(&mut self, column: impl Into<String>) -> &mut Self {
+        self.select_columns.push(column.into());
+        self
+    }
+
+    /// Adds a column to the outer GROUP BY clause.
+    ///
+    /// Use this with aggregation selects to group the results.
+    pub fn group_by(&mut self, column: impl Into<String>) -> &mut Self {
+        self.group_by_columns.push(column.into());
+        self
+    }
+
+    /// Converts to OuterQuery
+    pub(crate) fn build(self) -> OuterQuery {
+        OuterQuery {
+            conditions: self.conditions,
+            select_columns: self.select_columns,
+            group_by_columns: self.group_by_columns,
+        }
+    }
+}
 
 /// Result of building a query with conditions, arguments, and joins.
 ///
@@ -22,6 +93,16 @@ pub struct QueryBuildResult<'q, DB: Database> {
     pub joins: Vec<String>,
     /// Table alias for column references in SELECT clause (e.g., "base_query")
     pub table_alias: String,
+    /// Custom SELECT columns (overrides default "table_alias.*")
+    pub select_columns: Option<Vec<String>>,
+    /// GROUP BY columns
+    pub group_by_columns: Option<Vec<String>>,
+    /// DISTINCT ON columns (PostgreSQL-specific)
+    pub distinct_on_columns: Option<Vec<String>>,
+    /// Sort entries for ORDER BY clause
+    pub sort_entries: Vec<SortEntry>,
+    /// Outer query configuration (for window function filtering and aggregations)
+    pub outer_query: Option<OuterQuery>,
 }
 
 pub struct QueryBuilder<'q, T, DB: Database> {
@@ -43,6 +124,16 @@ pub struct QueryBuilder<'q, T, DB: Database> {
     pub(crate) table_alias: String,
     /// Explicit column cast overrides (takes precedence over inferred types)
     pub(crate) column_cast_overrides: HashMap<String, FieldType>,
+    /// Custom SELECT columns (overrides default "table_alias.*")
+    pub(crate) select_columns: Option<Vec<String>>,
+    /// GROUP BY columns
+    pub(crate) group_by_columns: Option<Vec<String>>,
+    /// DISTINCT ON columns (PostgreSQL-specific)
+    pub(crate) distinct_on_columns: Option<Vec<String>>,
+    /// Sort entries for ORDER BY clause
+    pub(crate) sort_entries: Vec<SortEntry>,
+    /// Outer query configuration (for window function filtering and aggregations)
+    pub(crate) outer_query: Option<OuterQuery>,
 }
 
 impl<'q, T, DB> QueryBuilder<'q, T, DB>
@@ -241,6 +332,26 @@ where
         self
     }
 
+    /// Used to extend the field meta with additional columns.
+    /// This is useful when you want to add columns that are not in the struct but are in the database.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - A vector of column names to add to the field meta
+    ///
+    /// # Returns
+    /// Returns self for method chaining
+    pub fn with_fields_from<U: Default + Serialize>(mut self) -> Self {
+        let additional_fields = get_struct_field_meta::<U>();
+        for column in additional_fields.keys() {
+            if !self.valid_columns.contains(column) {
+                self.valid_columns.push(column.clone());
+            }
+        }
+        self.field_meta.extend(additional_fields);
+        self
+    }
+
     pub fn map_column<F>(mut self, column: &str, mapper: F) -> Self 
     where
         F: Fn(&str, &str) -> (String, Option<String>) + 'static,
@@ -407,7 +518,7 @@ where
                 } else {
                     if !self.is_column_safe(field) {
                         #[cfg(feature = "tracing")]
-                        tracing::warn!(column = %field, "Skipping invalid filter column");
+                        tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
                         continue;
                     }
                     (
@@ -421,17 +532,22 @@ where
             // 1. Explicit column_cast_overrides (from with_column_cast)
             // 2. Virtual column or field_meta type (if not Unknown)
             // 3. Filter value type inference (fallback when type is Unknown)
-            let effective_field_type = if let Some(override_type) = self.column_cast_overrides.get(field) {
+            let filter_value_type = filter.value.to_field_type();
+
+            let mut effective_field_type = if let Some(override_type) = self.column_cast_overrides.get(field) {
                 override_type.clone()
             } else if field_type == FieldType::Unknown {
-                filter.value.to_field_type()
+                filter_value_type.clone()
             } else {
-                field_type
+                field_type.clone()
             };
 
+            // Down casting DateTime to Date for proper comparison
+            if effective_field_type == FieldType::DateTime && filter_value_type == FieldType::Date {
+                effective_field_type = FieldType::Date;
+            }
 
             let type_cast = self.dialect.type_cast(&effective_field_type);
-
             // If the filter value is a Date, cast the column to date for proper comparison
             // This ensures timestamp columns match all records on that calendar day
             let column_expr = if effective_field_type == FieldType::Date {
@@ -769,12 +885,126 @@ where
     ///     .build();
     /// // Use result.conditions, result.arguments, result.joins, result.table_alias
     /// ```
+    /// Adds a column to the SELECT clause.
+    ///
+    /// When custom SELECT columns are specified, the query will use these columns
+    /// instead of the default `table_alias.*`. This is useful for aggregate queries.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - A column expression to select (e.g., "id", "COUNT(*) as count")
+    pub fn with_select(mut self, column: impl Into<String>) -> Self {
+        let columns = self.select_columns.get_or_insert_with(Vec::new);
+        columns.push(column.into());
+        self
+    }
+
+    /// Adds a column to the GROUP BY clause.
+    ///
+    /// When GROUP BY columns are specified, the query will include a GROUP BY clause.
+    /// This is typically used with aggregate functions in SELECT.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - A column name or expression to group by
+    pub fn with_group_by(mut self, column: impl Into<String>) -> Self {
+        let columns = self.group_by_columns.get_or_insert_with(Vec::new);
+        columns.push(column.into());
+        self
+    }
+
+    /// Adds columns for PostgreSQL DISTINCT ON clause.
+    ///
+    /// DISTINCT ON selects the first row for each unique combination of the specified columns,
+    /// based on the ORDER BY clause. This is useful for deduplication without subqueries.
+    ///
+    /// Note: DISTINCT ON requires the DISTINCT columns to appear first in the ORDER BY clause.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - Column names to use in DISTINCT ON
+    pub fn with_distinct_on(mut self, columns: Vec<&str>) -> Self {
+        self.distinct_on_columns = Some(columns.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Adds a sort entry to the ORDER BY clause.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - A SortItem (Column or Expression)
+    /// * `direction` - Sort direction (Ascending or Descending)
+    pub fn with_sort(mut self, item: SortItem, direction: QuerySortDirection) -> Self {
+        self.sort_entries.push(SortEntry { item, direction });
+        self
+    }
+
+    /// Adds a column to the ORDER BY clause.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - Column name to sort by
+    /// * `direction` - Sort direction (Ascending or Descending)
+    pub fn with_sort_column(self, column: &str, direction: QuerySortDirection) -> Self {
+        self.with_sort(SortItem::column(column), direction)
+    }
+
+    /// Adds a raw SQL expression to the ORDER BY clause.
+    ///
+    /// # Arguments
+    ///
+    /// * `expression` - Raw SQL expression to sort by (e.g., "CASE WHEN ... END")
+    /// * `direction` - Sort direction (Ascending or Descending)
+    pub fn with_sort_expression(self, expression: &str, direction: QuerySortDirection) -> Self {
+        self.with_sort(SortItem::expression(expression), direction)
+    }
+
+    /// Configures the outer query using a callback pattern.
+    ///
+    /// Use this when you need to filter on window function results AND apply aggregations
+    /// to the filtered results. The callback receives an `OuterQueryBuilder` to configure
+    /// conditions, selects, and group by clauses.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// .with_outer(|outer| {
+    ///     outer
+    ///         .condition("transaction_rank = 1")
+    ///         .select("DATE(created_at) as date")
+    ///         .select("SUM(amount) as total")
+    ///         .group_by("DATE(created_at)");
+    /// })
+    /// ```
+    pub fn with_outer<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut OuterQueryBuilder),
+    {
+        let mut builder = self
+            .outer_query
+            .take()
+            .map(|oq| OuterQueryBuilder {
+                conditions: oq.conditions,
+                select_columns: oq.select_columns,
+                group_by_columns: oq.group_by_columns,
+            })
+            .unwrap_or_default();
+        f(&mut builder);
+        self.outer_query = Some(builder.build());
+        self
+    }
+
     pub fn build(self) -> QueryBuildResult<'q, DB> {
         QueryBuildResult {
             conditions: self.conditions,
             arguments: self.arguments,
             joins: self.active_joins,
             table_alias: self.table_alias,
+            select_columns: self.select_columns,
+            group_by_columns: self.group_by_columns,
+            distinct_on_columns: self.distinct_on_columns,
+            sort_entries: self.sort_entries,
+            outer_query: self.outer_query,
         }
     }
 }

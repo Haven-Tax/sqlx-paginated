@@ -6,7 +6,7 @@ use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue, Que
 use crate::QueryParams;
 use serde::Serialize;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryParamsBuilder<'q, T> {
     query: QueryParams<'q, T>,
 }
@@ -134,10 +134,10 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
         sort_column: impl Into<String>,
         sort_direction: QuerySortDirection,
     ) -> Self {
-        self.query.sort = QuerySortParams {
-            sort_column: sort_column.into(),
-            sort_direction,
-        };
+        self.query.sort = Some(QuerySortParams {
+            sort_column: Some(sort_column.into()),
+            sort_direction: Some(sort_direction),
+        });
         self
     }
 
@@ -336,7 +336,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
 mod tests {
     use super::*;
     use crate::paginated_query_as::internal::{
-        DEFAULT_SEARCH_COLUMN_NAMES, DEFAULT_SORT_COLUMN_NAME,
+        DEFAULT_SEARCH_COLUMN_NAMES,
     };
 
     #[derive(Debug, Default, Serialize)]
@@ -363,9 +363,8 @@ mod tests {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
         assert_eq!(
-            params.sort.sort_column, DEFAULT_SORT_COLUMN_NAME,
-            "Default sort column should be '{}'",
-            DEFAULT_SORT_COLUMN_NAME
+            params.sort.clone().and_then(|s| s.sort_column), None,
+            "Default sort column should be None"
         );
     }
 
@@ -395,17 +394,8 @@ mod tests {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
         assert!(params.pagination.is_none());
-        assert_eq!(params.sort.sort_column, DEFAULT_SORT_COLUMN_NAME);
-        assert_eq!(params.sort.sort_direction, QuerySortDirection::Descending);
-        assert_eq!(
-            params.search.search_columns,
-            Some(
-                DEFAULT_SEARCH_COLUMN_NAMES
-                    .iter()
-                    .map(|&s| s.to_string())
-                    .collect()
-            )
-        );
+        assert!(params.sort.is_none());
+        assert!(params.search.search_columns.is_none());
         assert!(params.search.search.is_none());
     }
 
@@ -414,11 +404,7 @@ mod tests {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
         assert!(params.pagination.is_none());
-        assert_eq!(params.sort.sort_column, "created_at");
-        assert!(matches!(
-            params.sort.sort_direction,
-            QuerySortDirection::Descending
-        ));
+        assert!(params.sort.is_none());
     }
 
     #[test]
@@ -433,11 +419,7 @@ mod tests {
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 10);
         assert_eq!(params.search.search, Some("test".to_string()));
-        assert_eq!(params.sort.sort_column, "created_at");
-        assert!(matches!(
-            params.sort.sort_direction,
-            QuerySortDirection::Descending
-        ));
+        assert!(params.sort.is_none());
     }
 
     #[test]
@@ -555,11 +537,8 @@ mod tests {
         let pagination = params.pagination.unwrap();
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 20);
-        assert_eq!(params.sort.sort_column, "name");
-        assert!(matches!(
-            params.sort.sort_direction,
-            QuerySortDirection::Ascending
-        ));
+        assert_eq!(params.sort.clone().and_then(|s| s.sort_column), Some("name".to_string()));
+        assert_eq!(params.sort.clone().and_then(|s| s.sort_direction), Some(QuerySortDirection::Ascending));
         assert_eq!(params.search.search, Some("test".to_string()));
         assert_eq!(
             params.search.search_columns,

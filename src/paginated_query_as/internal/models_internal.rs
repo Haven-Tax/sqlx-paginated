@@ -1,5 +1,5 @@
 use crate::paginated_query_as::internal::{
-    default_search_columns, default_sort_column, default_sort_direction,
+    default_search_columns,
     search_columns_deserialize, search_deserialize,
 };
 
@@ -19,19 +19,8 @@ pub struct QueryPaginationParams {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub struct QuerySortParams {
-    #[serde(default = "default_sort_direction")]
-    pub sort_direction: QuerySortDirection,
-    #[serde(default = "default_sort_column")]
-    pub sort_column: String,
-}
-
-impl Default for QuerySortParams {
-    fn default() -> Self {
-        Self {
-            sort_direction: default_sort_direction(),
-            sort_column: default_sort_column(),
-        }
-    }
+    pub sort_direction: Option<QuerySortDirection>,
+    pub sort_column: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -50,7 +39,7 @@ impl Default for QuerySearchParams {
     fn default() -> Self {
         Self {
             search: None,
-            search_columns: default_search_columns(),
+            search_columns: None,
         }
     }
 }
