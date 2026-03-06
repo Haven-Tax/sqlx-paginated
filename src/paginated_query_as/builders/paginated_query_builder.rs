@@ -216,7 +216,7 @@ where
                     .join(", ");
                 format!("DISTINCT ON ({}) ", cols_sql)
             }
-            _ => String::new(),
+            Some(_) | None => String::new(),
         };
 
         let outer_select_target = outer_query
@@ -376,7 +376,7 @@ where
 fn build_group_by_clause(group_by_columns: &Option<Vec<String>>) -> String {
     match group_by_columns {
         Some(cols) if !cols.is_empty() => format!(" GROUP BY {}", cols.join(", ")),
-        _ => String::new(),
+        Some(_) | None => String::new(),
     }
 }
 
