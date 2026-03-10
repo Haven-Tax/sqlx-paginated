@@ -5,6 +5,10 @@ use crate::paginated_query_as::models::{QuerySortDirection, SortEntry};
 use crate::{PaginatedResponse, QueryParams};
 use serde::Serialize;
 use sqlx::{postgres::Postgres, query::QueryAs, Execute, FromRow, IntoArguments, Pool};
+use std::sync::Arc;
+
+type BuildQueryFn<T> =
+    Arc<dyn for<'a> Fn(&QueryParams<'a, T>) -> QueryBuildResult<'static, Postgres> + Send + Sync>;
 
 pub struct PaginatedQueryBuilder<'q, T, A>
 where
@@ -13,7 +17,7 @@ where
     query: QueryAs<'q, Postgres, T, A>,
     params: QueryParams<'q, T>,
     totals_count_enabled: bool,
-    build_query_fn: fn(&QueryParams<T>) -> QueryBuildResult<'static, Postgres>,
+    build_query_fn: BuildQueryFn<T>,
 }
 
 /// A builder for constructing and executing paginated queries.
@@ -35,7 +39,12 @@ where
 /// (Attention: Only `Pool<Postgres>` is supported at the moment)
 impl<'q, T, A> PaginatedQueryBuilder<'q, T, A>
 where
-    T: for<'r> FromRow<'r, <Postgres as sqlx::Database>::Row> + Send + Unpin + Serialize + Default + 'static,
+    T: for<'r> FromRow<'r, <Postgres as sqlx::Database>::Row>
+        + Send
+        + Unpin
+        + Serialize
+        + Default
+        + 'static,
     A: 'q + IntoArguments<'q, Postgres> + Send,
 {
     /// Creates a new `PaginatedQueryBuilder` with default settings.
@@ -69,16 +78,19 @@ where
             query,
             params: QueryParams::default(),
             totals_count_enabled: true,
-            build_query_fn: |params| build_query_with_safe_defaults::<T>(params),
+            build_query_fn: Arc::new(|params| build_query_with_safe_defaults::<T>(params)),
         }
     }
 
-    pub fn with_query_builder(
-        self,
-        build_query_fn: fn(&QueryParams<T>) -> QueryBuildResult<'static, Postgres>,
-    ) -> Self {
+    pub fn with_query_builder<F>(self, build_query_fn: F) -> Self
+    where
+        F: for<'a> Fn(&QueryParams<'a, T>) -> QueryBuildResult<'static, Postgres>
+            + Send
+            + Sync
+            + 'static,
+    {
         Self {
-            build_query_fn,
+            build_query_fn: Arc::new(build_query_fn),
             ..self
         }
     }
@@ -123,7 +135,8 @@ where
         pool: &Pool<Postgres>,
     ) -> Result<PaginatedResponse<T>, sqlx::Error> {
         let base_sql = self.build_base_query();
-        let main_result = (self.build_query_fn)(&self.params);
+        let build_query_fn = &self.build_query_fn;
+        let main_result = build_query_fn(&self.params);
         let join_clause = self.build_join_clause(&main_result.joins);
         let where_clause = self.build_where_clause(&main_result.conditions);
         let group_by_clause = build_group_by_clause(&main_result.group_by_columns);
@@ -148,9 +161,13 @@ where
             .is_some_and(|c| !c.is_empty());
 
         let (total, total_pages, pagination) = if self.totals_count_enabled {
-            let count_result = (self.build_query_fn)(&self.params);
+            let count_result = build_query_fn(&self.params);
 
-            let count_sql = match (has_outer_conditions, has_outer_aggregation, group_by_present) {
+            let count_sql = match (
+                has_outer_conditions,
+                has_outer_aggregation,
+                group_by_present,
+            ) {
                 (true, true, _) => {
                     let inner_select = build_inner_select(
                         &select_target,
@@ -211,7 +228,13 @@ where
             Some(cols) if !cols.is_empty() => {
                 let cols_sql = cols
                     .iter()
-                    .map(|c| format!("{}.{}", quote_identifier(&main_result.table_alias), quote_identifier(c)))
+                    .map(|c| {
+                        format!(
+                            "{}.{}",
+                            quote_identifier(&main_result.table_alias),
+                            quote_identifier(c)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("DISTINCT ON ({}) ", cols_sql)
@@ -370,7 +393,6 @@ where
             None => String::new(),
         }
     }
-
 }
 
 fn build_group_by_clause(group_by_columns: &Option<Vec<String>>) -> String {
@@ -418,14 +440,14 @@ mod tests {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_table_alias("base_query")
             .build();
-        
+
         assert_eq!(result.table_alias, "base_query");
     }
 
     #[test]
     fn test_default_table_alias() {
         let result = QueryBuilder::<TestModel, Postgres>::new().build();
-        
+
         assert_eq!(result.table_alias, "base_query");
     }
 
@@ -434,7 +456,7 @@ mod tests {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_table_alias("custom_cte")
             .build();
-        
+
         assert_eq!(result.table_alias, "custom_cte");
     }
 }

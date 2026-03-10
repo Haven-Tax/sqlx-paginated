@@ -240,11 +240,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///     .build();
     /// ```
     pub fn with_eq_filter(self, field: impl Into<String>, value: impl Into<String>) -> Self {
-        self.with_filter(
-            field,
-            FilterOperator::Eq,
-            FilterValue::String(value.into()),
-        )
+        self.with_filter(field, FilterOperator::Eq, FilterValue::String(value.into()))
     }
 
     /// Adds multiple filters.
@@ -317,9 +313,6 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paginated_query_as::internal::{
-        DEFAULT_SEARCH_COLUMN_NAMES,
-    };
 
     #[derive(Debug, Default, Serialize)]
     struct TestModel {
@@ -345,26 +338,17 @@ mod tests {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
         assert_eq!(
-            params.sort.clone().and_then(|s| s.sort_column), None,
+            params.sort.clone().and_then(|s| s.sort_column),
+            None,
             "Default sort column should be None"
         );
     }
 
     #[test]
-    fn test_search_defaults() {
+    fn test_search_defaults_leave_search_columns_unset_in_builder() {
         let params = QueryParamsBuilder::<TestModel>::new().build();
 
-        assert_eq!(
-            params.search.search_columns,
-            Some(
-                DEFAULT_SEARCH_COLUMN_NAMES
-                    .iter()
-                    .map(|&s| s.to_string())
-                    .collect()
-            ),
-            "Default search columns should be {:?}",
-            DEFAULT_SEARCH_COLUMN_NAMES
-        );
+        assert!(params.search.search_columns.is_none());
         assert!(
             params.search.search.is_none(),
             "Default search term should be None"
@@ -519,8 +503,14 @@ mod tests {
         let pagination = params.pagination.unwrap();
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 20);
-        assert_eq!(params.sort.clone().and_then(|s| s.sort_column), Some("name".to_string()));
-        assert_eq!(params.sort.clone().and_then(|s| s.sort_direction), Some(QuerySortDirection::Ascending));
+        assert_eq!(
+            params.sort.clone().and_then(|s| s.sort_column),
+            Some("name".to_string())
+        );
+        assert_eq!(
+            params.sort.clone().and_then(|s| s.sort_direction),
+            Some(QuerySortDirection::Ascending)
+        );
         assert_eq!(params.search.search, Some("test".to_string()));
         assert_eq!(
             params.search.search_columns,
@@ -563,15 +553,27 @@ mod tests {
             .with_eq_filter("any_column", "value")
             .build();
 
-        assert_eq!(params.filters.len(), 1, "Filter should be passed through for QueryBuilder validation");
+        assert_eq!(
+            params.filters.len(),
+            1,
+            "Filter should be passed through for QueryBuilder validation"
+        );
         assert_eq!(params.filters[0].field, "any_column");
     }
 
     #[test]
     fn test_various_operators() {
         let params = QueryParamsBuilder::<TestModel>::new()
-            .with_filter("status", FilterOperator::Ne, FilterValue::String("deleted".to_string()))
-            .with_filter("name", FilterOperator::Like, FilterValue::String("%john%".to_string()))
+            .with_filter(
+                "status",
+                FilterOperator::Ne,
+                FilterValue::String("deleted".to_string()),
+            )
+            .with_filter(
+                "name",
+                FilterOperator::Like,
+                FilterValue::String("%john%".to_string()),
+            )
             .build();
 
         assert_eq!(params.filters.len(), 2);

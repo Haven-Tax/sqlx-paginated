@@ -1,4 +1,6 @@
-use crate::paginated_query_as::internal::{get_struct_field_meta, ColumnProtection, PostgresDialect};
+use crate::paginated_query_as::internal::{
+    get_struct_field_meta, ColumnProtection, PostgresDialect,
+};
 use crate::QueryBuilder;
 use serde::Serialize;
 use std::collections::HashMap;

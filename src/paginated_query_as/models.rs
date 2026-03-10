@@ -11,7 +11,7 @@ impl From<uuid::Uuid> for FilterValue {
     }
 }
 
-impl <T: Clone + Into<FilterValue>> From<&[T]> for FilterValue {
+impl<T: Clone + Into<FilterValue>> From<&[T]> for FilterValue {
     fn from(value: &[T]) -> Self {
         FilterValue::Array(value.iter().map(|v| v.clone().into()).collect())
     }
@@ -97,7 +97,10 @@ impl FilterValue {
             FilterValue::DateTime(dt) => dt.clone(),
             FilterValue::Date(d) => d.clone(),
             FilterValue::Time(t) => t.clone(),
-            FilterValue::Array(arr) => arr.first().map(|v| v.to_bindable_string()).unwrap_or_default(),
+            FilterValue::Array(arr) => arr
+                .first()
+                .map(|v| v.to_bindable_string())
+                .unwrap_or_default(),
             FilterValue::Null => String::new(),
         }
     }
@@ -141,7 +144,10 @@ impl FilterValue {
             FilterValue::DateTime(_) => FieldType::DateTime,
             FilterValue::Date(_) => FieldType::Date,
             FilterValue::Time(_) => FieldType::Time,
-            FilterValue::Array(arr) => arr.first().map(|v| v.to_field_type()).unwrap_or(FieldType::Unknown),
+            FilterValue::Array(arr) => arr
+                .first()
+                .map(|v| v.to_field_type())
+                .unwrap_or(FieldType::Unknown),
             FilterValue::Null => FieldType::Unknown,
         }
     }
@@ -244,7 +250,6 @@ pub struct SortEntry {
     pub direction: QuerySortDirection,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,7 +262,10 @@ mod tests {
 
     #[test]
     fn test_to_field_type_float() {
-        assert_eq!(FilterValue::Float(3.14).to_field_type(), FieldType::Float);
+        assert_eq!(
+            FilterValue::Float(std::f64::consts::PI).to_field_type(),
+            FieldType::Float
+        );
     }
 
     #[test]
@@ -267,7 +275,10 @@ mod tests {
 
     #[test]
     fn test_to_field_type_string() {
-        assert_eq!(FilterValue::String("test".to_string()).to_field_type(), FieldType::String);
+        assert_eq!(
+            FilterValue::String("test".to_string()).to_field_type(),
+            FieldType::String
+        );
     }
 
     #[test]

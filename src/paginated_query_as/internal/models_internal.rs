@@ -1,6 +1,5 @@
 use crate::paginated_query_as::internal::{
-    default_search_columns,
-    search_columns_deserialize, search_deserialize,
+    default_search_columns, search_columns_deserialize, search_deserialize,
 };
 
 use crate::QuerySortDirection;
@@ -43,7 +42,6 @@ impl Default for QuerySearchParams {
         }
     }
 }
-
 
 use crate::paginated_query_as::internal::internal_utils::FieldType;
 

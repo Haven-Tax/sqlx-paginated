@@ -1,7 +1,10 @@
 use crate::paginated_query_as::internal::{
-    ColumnProtection, FieldType, QueryDialect, VirtualColumn, VirtualColumnBuilder, get_struct_field_meta,
+    get_struct_field_meta, ColumnProtection, FieldType, QueryDialect, VirtualColumn,
+    VirtualColumnBuilder,
 };
-use crate::paginated_query_as::models::{FilterOperator, FilterValue, QueryParams, SortEntry, SortItem, QuerySortDirection};
+use crate::paginated_query_as::models::{
+    FilterOperator, FilterValue, QueryParams, QuerySortDirection, SortEntry, SortItem,
+};
 use serde::Serialize;
 use sqlx::{Arguments, Database, Encode, Type};
 use std::collections::HashMap;
@@ -25,7 +28,9 @@ impl OuterQuery {
 
     /// Returns true if this outer query has any configuration.
     pub fn is_empty(&self) -> bool {
-        self.conditions.is_empty() && self.select_columns.is_empty() && self.group_by_columns.is_empty()
+        self.conditions.is_empty()
+            && self.select_columns.is_empty()
+            && self.group_by_columns.is_empty()
     }
 }
 
@@ -163,10 +168,10 @@ where
             return true;
         }
 
-        let column_exists = if self.column_validation_enabled { 
+        let column_exists = if self.column_validation_enabled {
             self.valid_columns.contains(&column.to_string())
-        } else { 
-            true 
+        } else {
+            true
         };
 
         if !self.protection_enabled {
@@ -266,7 +271,11 @@ where
     /// Formats a column name with the table alias.
     /// Returns `"alias"."column"` format.
     fn format_column(&self, column: &str) -> String {
-        format!("{}.{}", self.dialect.quote_identifier(&self.table_alias), self.dialect.quote_identifier(column))
+        format!(
+            "{}.{}",
+            self.dialect.quote_identifier(&self.table_alias),
+            self.dialect.quote_identifier(column)
+        )
     }
 
     /// Registers a virtual column that can be used in search and filter operations.
@@ -352,7 +361,7 @@ where
         self
     }
 
-    pub fn map_column<F>(mut self, column: &str, mapper: F) -> Self 
+    pub fn map_column<F>(mut self, column: &str, mapper: F) -> Self
     where
         F: Fn(&str, &str) -> (String, Option<String>) + 'static,
     {
@@ -417,10 +426,7 @@ where
                                         vc.expression, placeholder
                                     ))
                                 } else {
-                                    Some(format!(
-                                        "({})::text LIKE {}",
-                                        vc.expression, placeholder
-                                    ))
+                                    Some(format!("({})::text LIKE {}", vc.expression, placeholder))
                                 };
                             }
 
@@ -432,7 +438,11 @@ where
                                 return None;
                             }
 
-                            let field_type = self.field_meta.get(column).cloned().unwrap_or(FieldType::Unknown);
+                            let field_type = self
+                                .field_meta
+                                .get(column)
+                                .cloned()
+                                .unwrap_or(FieldType::Unknown);
 
                             let mapped_column = mapper.map(|mapper| mapper(column, search));
 
@@ -447,7 +457,10 @@ where
                                 .unwrap_or_else(|| self.dialect.placeholder(next_argument));
 
                             if field_type == FieldType::String {
-                                Some(format!("LOWER({}) LIKE LOWER({})", table_column, placeholder))
+                                Some(format!(
+                                    "LOWER({}) LIKE LOWER({})",
+                                    table_column, placeholder
+                                ))
                             } else {
                                 Some(format!("{}::text LIKE {}", table_column, placeholder))
                             }
@@ -511,22 +524,25 @@ where
             let field = &filter.field;
 
             // Check for virtual column first
-            let (table_column, field_type) =
-                if let Some(vc) = self.virtual_columns.get(field).cloned() {
-                    self.activate_joins(&vc);
-                    (vc.expression.clone(), vc.column_type.clone())
-                } else {
-                    if !self.is_column_safe(field) {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
-                        continue;
-                    }
-                    (
-                        self.format_column(field),
-                        self.field_meta.get(field).cloned().unwrap_or(FieldType::Unknown),
-                    )
-                };
-
+            let (table_column, field_type) = if let Some(vc) =
+                self.virtual_columns.get(field).cloned()
+            {
+                self.activate_joins(&vc);
+                (vc.expression.clone(), vc.column_type.clone())
+            } else {
+                if !self.is_column_safe(field) {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
+                    continue;
+                }
+                (
+                    self.format_column(field),
+                    self.field_meta
+                        .get(field)
+                        .cloned()
+                        .unwrap_or(FieldType::Unknown),
+                )
+            };
 
             // Type resolution order (highest priority first):
             // 1. Explicit column_cast_overrides (from with_column_cast)
@@ -534,13 +550,14 @@ where
             // 3. Filter value type inference (fallback when type is Unknown)
             let filter_value_type = filter.value.to_field_type();
 
-            let mut effective_field_type = if let Some(override_type) = self.column_cast_overrides.get(field) {
-                override_type.clone()
-            } else if field_type == FieldType::Unknown {
-                filter_value_type.clone()
-            } else {
-                field_type.clone()
-            };
+            let mut effective_field_type =
+                if let Some(override_type) = self.column_cast_overrides.get(field) {
+                    override_type.clone()
+                } else if field_type == FieldType::Unknown {
+                    filter_value_type.clone()
+                } else {
+                    field_type.clone()
+                };
 
             // Down casting DateTime to Date for proper comparison
             if effective_field_type == FieldType::DateTime && filter_value_type == FieldType::Date {
@@ -608,7 +625,9 @@ where
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
                     // Cast column to text for pattern matching on non-text types
-                    if effective_field_type != FieldType::String && effective_field_type != FieldType::Unknown {
+                    if effective_field_type != FieldType::String
+                        && effective_field_type != FieldType::Unknown
+                    {
                         format!("{}::text LIKE {}", table_column, placeholder)
                     } else {
                         format!("{} LIKE {}", table_column, placeholder)
@@ -619,7 +638,9 @@ where
                     let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
                     self.arguments.add(value).unwrap_or_default();
                     // Cast column to text for pattern matching on non-text types
-                    if effective_field_type != FieldType::String && effective_field_type != FieldType::Unknown {
+                    if effective_field_type != FieldType::String
+                        && effective_field_type != FieldType::Unknown
+                    {
                         format!("{}::text ILIKE {}", table_column, placeholder)
                     } else {
                         format!("{} ILIKE {}", table_column, placeholder)
@@ -658,7 +679,10 @@ where
                         self.arguments.add(values[0].clone()).unwrap_or_default();
                         let placeholder2 = self.dialect.placeholder(self.arguments.len() + 1);
                         self.arguments.add(values[1].clone()).unwrap_or_default();
-                        format!("{} BETWEEN {}{} AND {}{}", column_expr, placeholder1, type_cast, placeholder2, type_cast)
+                        format!(
+                            "{} BETWEEN {}{} AND {}{}",
+                            column_expr, placeholder1, type_cast, placeholder2, type_cast
+                        )
                     } else {
                         continue;
                     }
@@ -1045,7 +1069,9 @@ mod tests {
         }
     }
 
-    fn make_option_params_with_filter(filter: Filter) -> QueryParams<'static, TestModelWithOptions> {
+    fn make_option_params_with_filter(
+        filter: Filter,
+    ) -> QueryParams<'static, TestModelWithOptions> {
         QueryParams {
             filters: vec![filter],
             ..Default::default()
@@ -1302,7 +1328,9 @@ mod tests {
         let filter = Filter {
             field: "user_uuid".to_string(),
             operator: FilterOperator::Eq,
-            value: FilterValue::Uuid(uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            value: FilterValue::Uuid(
+                uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            ),
         };
         let params = make_params_with_filter(filter);
 
@@ -1441,10 +1469,7 @@ mod tests {
         let filter = Filter {
             field: "optional_amount".to_string(),
             operator: FilterOperator::Between,
-            value: FilterValue::Array(vec![
-                FilterValue::Float(10.0),
-                FilterValue::Float(100.0),
-            ]),
+            value: FilterValue::Array(vec![FilterValue::Float(10.0), FilterValue::Float(100.0)]),
         };
         let params: QueryParams<TestModelWithOptions> = QueryParams {
             filters: vec![filter],
@@ -1846,9 +1871,7 @@ mod tests {
         };
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
-            .with_virtual_column("computed_field", |_vc| {
-                "some_expression"
-            })
+            .with_virtual_column("computed_field", |_vc| "some_expression")
             .with_column_cast("computed_field", FieldType::Int)
             .with_filters(&params)
             .build();
@@ -1917,7 +1940,7 @@ mod tests {
         };
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
-            .with_column_cast("name", FieldType::Uuid)  // Override name to Uuid
+            .with_column_cast("name", FieldType::Uuid) // Override name to Uuid
             .with_filters(&params)
             .build();
 

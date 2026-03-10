@@ -1,6 +1,4 @@
-use crate::paginated_query_as::internal::{
-    DEFAULT_SEARCH_COLUMN_NAMES,
-};
+use crate::paginated_query_as::internal::DEFAULT_SEARCH_COLUMN_NAMES;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;

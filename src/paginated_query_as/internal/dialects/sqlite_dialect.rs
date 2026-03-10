@@ -16,7 +16,6 @@ impl QueryDialect for SqliteDialect {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

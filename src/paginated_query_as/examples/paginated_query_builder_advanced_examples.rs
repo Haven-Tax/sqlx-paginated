@@ -20,13 +20,11 @@ pub struct UserExample {
 pub async fn paginated_query_builder_advanced_example(
     pool: PgPool,
 ) -> PaginatedResponse<UserExample> {
-    let some_extra_filters = vec![
-        Filter {
-            field: "role".to_string(),
-            operator: FilterOperator::Eq,
-            value: FilterValue::String("admin".to_string()),
-        },
-    ];
+    let some_extra_filters = vec![Filter {
+        field: "role".to_string(),
+        operator: FilterOperator::Eq,
+        value: FilterValue::String("admin".to_string()),
+    }];
     let initial_params = QueryParamsBuilder::<UserExample>::new()
         .with_search("john", vec!["name", "email"])
         .with_pagination(1, 10)
