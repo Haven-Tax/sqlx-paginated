@@ -139,7 +139,8 @@ where
         let main_result = build_query_fn(&self.params);
         let join_clause = self.build_join_clause(&main_result.joins);
         let where_clause = self.build_where_clause(&main_result.conditions);
-        let group_by_clause = build_group_by_clause(&main_result.group_by_columns);
+        let group_by_clause =
+            build_group_by_clause(main_result.group_by_columns.as_deref().unwrap_or(&[]));
         let outer_query = main_result.outer_query.as_ref();
         let has_outer_conditions = outer_query.is_some_and(|oq| !oq.conditions.is_empty());
         let outer_where_clause = outer_query
@@ -153,7 +154,7 @@ where
 
         let has_outer_aggregation = outer_query.is_some_and(|oq| !oq.group_by_columns.is_empty());
         let outer_group_by_clause_for_count = outer_query
-            .map(|oq| build_group_by_clause_from_vec(&oq.group_by_columns))
+            .map(|oq| build_group_by_clause(&oq.group_by_columns))
             .unwrap_or_default();
         let group_by_present = main_result
             .group_by_columns
@@ -248,7 +249,7 @@ where
             .unwrap_or_else(|| "*".to_string());
 
         let outer_group_by_clause = outer_query
-            .map(|oq| build_group_by_clause_from_vec(&oq.group_by_columns))
+            .map(|oq| build_group_by_clause(&oq.group_by_columns))
             .unwrap_or_default();
 
         let mut main_sql = if has_outer_conditions {
@@ -395,14 +396,7 @@ where
     }
 }
 
-fn build_group_by_clause(group_by_columns: &Option<Vec<String>>) -> String {
-    match group_by_columns {
-        Some(cols) if !cols.is_empty() => format!(" GROUP BY {}", cols.join(", ")),
-        Some(_) | None => String::new(),
-    }
-}
-
-fn build_group_by_clause_from_vec(group_by_columns: &[String]) -> String {
+fn build_group_by_clause(group_by_columns: &[String]) -> String {
     if group_by_columns.is_empty() {
         String::new()
     } else {
