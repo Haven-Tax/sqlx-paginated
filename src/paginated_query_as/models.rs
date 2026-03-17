@@ -1,5 +1,6 @@
 use crate::paginated_query_as::internal::{
-    filters_deserialize, page_deserialize, page_size_deserialize, FilterParseError,
+    filters_deserialize, page_deserialize, page_size_deserialize, quote_identifier,
+    FilterParseError,
     QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use serde::{Deserialize, Serialize};
@@ -238,7 +239,11 @@ impl SortItem {
 
     pub fn to_sql(&self, table_alias: &str) -> String {
         match self {
-            SortItem::Column(col) => format!("\"{}\".\"{}\"", table_alias, col),
+            SortItem::Column(col) => format!(
+                "{}.{}",
+                quote_identifier(table_alias),
+                quote_identifier(col)
+            ),
             SortItem::Expression(expr) => expr.clone(),
         }
     }
@@ -326,5 +331,21 @@ mod tests {
     #[test]
     fn test_to_field_type_null_returns_unknown() {
         assert_eq!(FilterValue::Null.to_field_type(), FieldType::Unknown);
+    }
+
+    #[test]
+    fn test_sort_item_column_to_sql_quotes_identifiers() {
+        assert_eq!(
+            SortItem::column("display\"name").to_sql("user\"records"),
+            "\"user\"\"records\".\"display\"\"name\""
+        );
+    }
+
+    #[test]
+    fn test_sort_item_expression_to_sql_preserves_expression() {
+        assert_eq!(
+            SortItem::expression("LOWER(name)").to_sql("ignored"),
+            "LOWER(name)"
+        );
     }
 }
