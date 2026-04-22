@@ -17,6 +17,7 @@ pub mod postgres_examples {
         QueryBuilder::<T, Postgres>::new()
             .with_search(params)
             .with_filters(params)
+            .with_sorting(params)
             .disable_protection()
             .build()
     }
@@ -31,6 +32,7 @@ pub mod postgres_examples {
         QueryBuilder::<T, Postgres>::new()
             .with_search(params)
             .with_filters(params)
+            .with_sorting(params)
             .build()
     }
 
