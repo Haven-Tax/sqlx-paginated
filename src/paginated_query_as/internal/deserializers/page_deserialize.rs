@@ -49,10 +49,7 @@ mod tests {
     #[test]
     fn test_page_deserialize_empty() {
         assert_eq!(deserialize_test(r#""""#, page_deserialize).unwrap(), None);
-        assert_eq!(
-            deserialize_test(r#""  ""#, page_deserialize).unwrap(),
-            None
-        );
+        assert_eq!(deserialize_test(r#""  ""#, page_deserialize).unwrap(), None);
     }
 
     #[test]

@@ -1,9 +1,28 @@
 use crate::paginated_query_as::internal::{
-    filters_deserialize, page_deserialize, page_size_deserialize, FilterParseError,
+    filters_deserialize, page_deserialize, page_size_deserialize, quote_identifier,
+    FilterParseError,
     QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+
+impl From<uuid::Uuid> for FilterValue {
+    fn from(value: uuid::Uuid) -> Self {
+        FilterValue::Uuid(value)
+    }
+}
+
+impl<T: Clone + Into<FilterValue>> From<&[T]> for FilterValue {
+    fn from(value: &[T]) -> Self {
+        FilterValue::Array(value.iter().map(|v| v.clone().into()).collect())
+    }
+}
+
+impl<T: Into<FilterValue>> From<Vec<T>> for FilterValue {
+    fn from(value: Vec<T>) -> Self {
+        FilterValue::Array(value.into_iter().map(|v| v.into()).collect())
+    }
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct PaginatedResponse<T> {
@@ -79,7 +98,10 @@ impl FilterValue {
             FilterValue::DateTime(dt) => dt.clone(),
             FilterValue::Date(d) => d.clone(),
             FilterValue::Time(t) => t.clone(),
-            FilterValue::Array(arr) => arr.first().map(|v| v.to_bindable_string()).unwrap_or_default(),
+            FilterValue::Array(arr) => arr
+                .first()
+                .map(|v| v.to_bindable_string())
+                .unwrap_or_default(),
             FilterValue::Null => String::new(),
         }
     }
@@ -123,7 +145,10 @@ impl FilterValue {
             FilterValue::DateTime(_) => FieldType::DateTime,
             FilterValue::Date(_) => FieldType::Date,
             FilterValue::Time(_) => FieldType::Time,
-            FilterValue::Array(arr) => arr.first().map(|v| v.to_field_type()).unwrap_or(FieldType::Unknown),
+            FilterValue::Array(arr) => arr
+                .first()
+                .map(|v| v.to_field_type())
+                .unwrap_or(FieldType::Unknown),
             FilterValue::Null => FieldType::Unknown,
         }
     }
@@ -142,7 +167,7 @@ pub struct Filter {
 #[derive(Clone, Debug)]
 pub struct QueryParams<'q, T> {
     pub pagination: Option<QueryPaginationParams>,
-    pub sort: QuerySortParams,
+    pub sort: Option<QuerySortParams>,
     pub search: QuerySearchParams,
     pub filters: Vec<Filter>,
     pub(crate) _phantom: PhantomData<&'q T>,
@@ -152,7 +177,7 @@ impl<'q, T> Default for QueryParams<'q, T> {
     fn default() -> Self {
         Self {
             pagination: None,
-            sort: QuerySortParams::default(),
+            sort: None,
             search: QuerySearchParams::default(),
             filters: Vec::new(),
             _phantom: PhantomData,
@@ -181,7 +206,7 @@ impl<'q, T> TryFrom<FlatQueryParams> for QueryParams<'q, T> {
 
         Ok(QueryParams {
             pagination,
-            sort: params.sort.unwrap_or_default(),
+            sort: params.sort,
             search: params.search.unwrap_or_default(),
             filters: params.filters.unwrap_or_default(),
             _phantom: PhantomData,
@@ -197,6 +222,38 @@ pub enum QuerySortDirection {
     Descending,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortItem {
+    Column(String),
+    Expression(String),
+}
+
+impl SortItem {
+    pub fn column(name: &str) -> Self {
+        SortItem::Column(name.to_string())
+    }
+
+    pub fn expression(expr: &str) -> Self {
+        SortItem::Expression(expr.to_string())
+    }
+
+    pub fn to_sql(&self, table_alias: &str) -> String {
+        match self {
+            SortItem::Column(col) => format!(
+                "{}.{}",
+                quote_identifier(table_alias),
+                quote_identifier(col)
+            ),
+            SortItem::Expression(expr) => expr.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortEntry {
+    pub item: SortItem,
+    pub direction: QuerySortDirection,
+}
 
 #[cfg(test)]
 mod tests {
@@ -210,7 +267,10 @@ mod tests {
 
     #[test]
     fn test_to_field_type_float() {
-        assert_eq!(FilterValue::Float(3.14).to_field_type(), FieldType::Float);
+        assert_eq!(
+            FilterValue::Float(std::f64::consts::PI).to_field_type(),
+            FieldType::Float
+        );
     }
 
     #[test]
@@ -220,7 +280,10 @@ mod tests {
 
     #[test]
     fn test_to_field_type_string() {
-        assert_eq!(FilterValue::String("test".to_string()).to_field_type(), FieldType::String);
+        assert_eq!(
+            FilterValue::String("test".to_string()).to_field_type(),
+            FieldType::String
+        );
     }
 
     #[test]
@@ -268,5 +331,21 @@ mod tests {
     #[test]
     fn test_to_field_type_null_returns_unknown() {
         assert_eq!(FilterValue::Null.to_field_type(), FieldType::Unknown);
+    }
+
+    #[test]
+    fn test_sort_item_column_to_sql_quotes_identifiers() {
+        assert_eq!(
+            SortItem::column("display\"name").to_sql("user\"records"),
+            "\"user\"\"records\".\"display\"\"name\""
+        );
+    }
+
+    #[test]
+    fn test_sort_item_expression_to_sql_preserves_expression() {
+        assert_eq!(
+            SortItem::expression("LOWER(name)").to_sql("ignored"),
+            "LOWER(name)"
+        );
     }
 }

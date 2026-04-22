@@ -1,4 +1,6 @@
-use crate::paginated_query_as::internal::{get_struct_field_meta, ColumnProtection, PostgresDialect};
+use crate::paginated_query_as::internal::{
+    get_struct_field_meta, ColumnProtection, PostgresDialect,
+};
 use crate::QueryBuilder;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -35,6 +37,11 @@ where
             active_joins: Vec::new(),
             table_alias: "base_query".to_string(),
             column_cast_overrides: HashMap::new(),
+            select_columns: None,
+            group_by_columns: None,
+            distinct_on_columns: None,
+            sort_entries: Vec::new(),
+            outer_query: None,
         }
     }
 }

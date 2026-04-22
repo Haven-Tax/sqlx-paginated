@@ -88,9 +88,7 @@ fn parse_filter_value(s: &str) -> FilterValue {
 
 /// Parses comma-separated values into a Vec<FilterValue>.
 fn parse_array_values(s: &str) -> Vec<FilterValue> {
-    s.split(',')
-        .map(|v| parse_filter_value(v.trim()))
-        .collect()
+    s.split(',').map(|v| parse_filter_value(v.trim())).collect()
 }
 
 /// Deserializes query parameters into a Vec<Filter>.
@@ -199,7 +197,8 @@ mod tests {
 
     #[test]
     fn test_parse_filter_value_float() {
-        assert_eq!(parse_filter_value("3.14"), FilterValue::Float(3.14));
+        let pi = std::f64::consts::PI;
+        assert_eq!(parse_filter_value(&pi.to_string()), FilterValue::Float(pi));
         assert_eq!(parse_filter_value("-2.5"), FilterValue::Float(-2.5));
     }
 

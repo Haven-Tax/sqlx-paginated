@@ -26,7 +26,6 @@ impl QueryDialect for PostgresDialect {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

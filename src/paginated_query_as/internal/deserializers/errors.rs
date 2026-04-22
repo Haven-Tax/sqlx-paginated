@@ -24,7 +24,10 @@ impl std::error::Error for FilterParseError {}
 impl fmt::Display for FilterParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidOperator { field, raw_operator } => {
+            Self::InvalidOperator {
+                field,
+                raw_operator,
+            } => {
                 write!(
                     f,
                     "invalid operator '{}' for field '{}'",
