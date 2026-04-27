@@ -969,7 +969,12 @@ where
     ///
     /// * `column` - Column name to sort by
     /// * `direction` - Sort direction (Ascending or Descending)
-    pub fn with_sort_column(self, column: &str, direction: QuerySortDirection) -> Self {
+    pub fn with_sort_column(mut self, column: &str, direction: QuerySortDirection) -> Self {
+        if let Some(vc) = self.virtual_columns.get(column).cloned() {
+            self.activate_joins(&vc);
+            return self.with_sort(SortItem::expression(&vc.expression), direction);
+        }
+        
         self.with_sort(SortItem::column(column), direction)
     }
 
@@ -981,6 +986,20 @@ where
     /// * `direction` - Sort direction (Ascending or Descending)
     pub fn with_sort_expression(self, expression: &str, direction: QuerySortDirection) -> Self {
         self.with_sort(SortItem::expression(expression), direction)
+    }
+
+    /// Applies a sort from `QueryParams` (typically URL-driven), resolving virtual columns.
+    ///
+    /// If `params.sort` names a registered virtual column, its expression is used and any
+    /// associated joins are activated — mirroring the behavior of `with_filters` and `with_search`.
+    pub fn with_sorting(self, params: &QueryParams<T>) -> Self {
+        let Some(sort) = params.sort.as_ref() else {
+            return self;
+        };
+        match (sort.sort_column.as_deref(), sort.sort_direction.as_ref()) {
+            (Some(column), Some(direction)) => self.with_sort_column(column, direction.clone()),
+            _ => self,
+        }
     }
 
     /// Configures the outer query using a callback pattern.
@@ -1036,6 +1055,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paginated_query_as::internal::QuerySortParams;
     use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue, QueryParams};
     use serde::Serialize;
     use sqlx::Postgres;
@@ -1956,5 +1976,96 @@ mod tests {
             "name should have ::uuid from override, got: {}",
             result.conditions[1]
         );
+    }
+
+    // ========================================
+    // Virtual Column Sort Tests
+    // ========================================
+
+    #[test]
+    fn test_with_sort_column_resolves_virtual_column_expression() {
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_virtual_column("payment_date", |vc| {
+                vc.with_join("LEFT JOIN bill_activities ba ON ba.bill_id = base_query.id");
+                "ba.created_at"
+            })
+            .with_sort_column("payment_date", QuerySortDirection::Descending)
+            .build();
+
+        let order_sql = result.sort_entries[0].item.to_sql("base_query");
+        assert_eq!(
+            order_sql, "ba.created_at",
+            "virtual sort must emit the expression, not the aliased column"
+        );
+        assert!(
+            result.joins.iter().any(|j| j.contains("bill_activities ba")),
+            "virtual sort must activate the registered join, got joins: {:?}",
+            result.joins
+        );
+    }
+
+    #[test]
+    fn test_with_sort_column_non_virtual_falls_through_to_column() {
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_sort_column("name", QuerySortDirection::Ascending)
+            .build();
+
+        let order_sql = result.sort_entries[0].item.to_sql("base_query");
+        assert_eq!(order_sql, "\"base_query\".\"name\"");
+        assert!(result.joins.is_empty());
+    }
+
+    #[test]
+    fn test_with_sorting_resolves_params_sort_through_virtual_column() {
+        let params: QueryParams<TestModel> = QueryParams {
+            sort: Some(QuerySortParams {
+                sort_column: Some("payment_date".to_string()),
+                sort_direction: Some(QuerySortDirection::Descending),
+            }),
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_virtual_column("payment_date", |vc| {
+                vc.with_join("LEFT JOIN bill_activities ba ON ba.bill_id = base_query.id");
+                "ba.created_at"
+            })
+            .with_sorting(&params)
+            .build();
+
+        assert_eq!(result.sort_entries.len(), 1);
+        assert_eq!(
+            result.sort_entries[0].item.to_sql("base_query"),
+            "ba.created_at",
+            "URL-driven sort must resolve virtual column expression"
+        );
+        assert!(
+            result.joins.iter().any(|j| j.contains("bill_activities ba")),
+            "URL-driven sort must activate the registered join"
+        );
+    }
+
+    #[test]
+    fn test_with_sorting_no_sort_param_is_noop() {
+        let params: QueryParams<TestModel> = QueryParams::default();
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_sorting(&params)
+            .build();
+        assert!(result.sort_entries.is_empty());
+    }
+
+    #[test]
+    fn test_with_sorting_missing_direction_is_noop() {
+        let params: QueryParams<TestModel> = QueryParams {
+            sort: Some(QuerySortParams {
+                sort_column: Some("name".to_string()),
+                sort_direction: None,
+            }),
+            ..Default::default()
+        };
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_sorting(&params)
+            .build();
+        assert!(result.sort_entries.is_empty());
     }
 }

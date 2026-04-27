@@ -161,51 +161,38 @@ where
             .as_ref()
             .is_some_and(|c| !c.is_empty());
 
+        let distinct_clause = match &main_result.distinct_on_columns {
+            Some(cols) if !cols.is_empty() => {
+                let cols_sql = cols
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}.{}",
+                            quote_identifier(&main_result.table_alias),
+                            quote_identifier(c)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("DISTINCT ON ({}) ", cols_sql)
+            }
+            Some(_) | None => String::new(),
+        };
         let (total, total_pages, pagination) = if self.totals_count_enabled {
             let count_result = build_query_fn(&self.params);
-
-            let count_sql = match (
+            let count_sql = build_count_sql(CountSqlInputs {
+                base_sql: &base_sql,
+                select_target: &select_target,
+                distinct_clause: &distinct_clause,
+                join_clause: &join_clause,
+                where_clause: &where_clause,
+                group_by_clause: &group_by_clause,
+                outer_where_clause: &outer_where_clause,
+                outer_group_by_clause_for_count: &outer_group_by_clause_for_count,
                 has_outer_conditions,
                 has_outer_aggregation,
                 group_by_present,
-            ) {
-                (true, true, _) => {
-                    let inner_select = build_inner_select(
-                        &select_target,
-                        &join_clause,
-                        &where_clause,
-                        &group_by_clause,
-                    );
-                    let outer_select = format!(
-                        "SELECT 1 FROM ({}) AS inner_query{}{}",
-                        inner_select, outer_where_clause, outer_group_by_clause_for_count
-                    );
-                    format!(
-                        "{} SELECT COUNT(*) FROM ({}) AS aggregated",
-                        base_sql, outer_select
-                    )
-                }
-                (true, false, _) => {
-                    let inner_select = build_inner_select(
-                        &select_target,
-                        &join_clause,
-                        &where_clause,
-                        &group_by_clause,
-                    );
-                    format!(
-                        "{} SELECT COUNT(*) FROM ({}) AS inner_query{}",
-                        base_sql, inner_select, outer_where_clause
-                    )
-                }
-                (false, _, true) => format!(
-                    "{} SELECT COUNT(*) FROM (SELECT 1 FROM base_query{}{}{}) AS grouped",
-                    base_sql, join_clause, where_clause, group_by_clause
-                ),
-                (false, _, false) => format!(
-                    "{} SELECT COUNT(*) FROM base_query{}{}",
-                    base_sql, join_clause, where_clause
-                ),
-            };
+            });
             let count: i64 = sqlx::query_scalar_with(&count_sql, count_result.arguments)
                 .fetch_one(pool)
                 .await?;
@@ -223,24 +210,6 @@ where
             }
         } else {
             (None, None, None)
-        };
-
-        let distinct_clause = match &main_result.distinct_on_columns {
-            Some(cols) if !cols.is_empty() => {
-                let cols_sql = cols
-                    .iter()
-                    .map(|c| {
-                        format!(
-                            "{}.{}",
-                            quote_identifier(&main_result.table_alias),
-                            quote_identifier(c)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("DISTINCT ON ({}) ", cols_sql)
-            }
-            Some(_) | None => String::new(),
         };
 
         let outer_select_target = outer_query
@@ -404,6 +373,76 @@ fn build_group_by_clause(group_by_columns: &[String]) -> String {
     }
 }
 
+struct CountSqlInputs<'a> {
+    base_sql: &'a str,
+    select_target: &'a str,
+    distinct_clause: &'a str,
+    join_clause: &'a str,
+    where_clause: &'a str,
+    group_by_clause: &'a str,
+    outer_where_clause: &'a str,
+    outer_group_by_clause_for_count: &'a str,
+    has_outer_conditions: bool,
+    has_outer_aggregation: bool,
+    group_by_present: bool,
+}
+
+fn build_count_sql(i: CountSqlInputs<'_>) -> String {
+    let has_distinct = !i.distinct_clause.is_empty();
+    let inner_select_target = format!("{}{}", i.distinct_clause, i.select_target);
+
+    match (
+        i.has_outer_conditions,
+        i.has_outer_aggregation,
+        i.group_by_present,
+    ) {
+        (true, true, _) => {
+            let inner_select = build_inner_select(
+                &inner_select_target,
+                i.join_clause,
+                i.where_clause,
+                i.group_by_clause,
+            );
+            let outer_select = format!(
+                "SELECT 1 FROM ({}) AS inner_query{}{}",
+                inner_select, i.outer_where_clause, i.outer_group_by_clause_for_count
+            );
+            format!(
+                "{} SELECT COUNT(*) FROM ({}) AS aggregated",
+                i.base_sql, outer_select
+            )
+        }
+        (true, false, _) => {
+            let inner_select = build_inner_select(
+                &inner_select_target,
+                i.join_clause,
+                i.where_clause,
+                i.group_by_clause,
+            );
+            format!(
+                "{} SELECT COUNT(*) FROM ({}) AS inner_query{}",
+                i.base_sql, inner_select, i.outer_where_clause
+            )
+        }
+        (false, _, true) => format!(
+            "{} SELECT COUNT(*) FROM (SELECT {} FROM base_query{}{}{}) AS grouped",
+            i.base_sql,
+            if has_distinct { inner_select_target.as_str() } else { "1" },
+            i.join_clause,
+            i.where_clause,
+            i.group_by_clause
+        ),
+        (false, _, false) if has_distinct => format!(
+            "{} SELECT COUNT(*) FROM (SELECT {} FROM base_query{}{}) AS distinct_query",
+            i.base_sql, inner_select_target, i.join_clause, i.where_clause
+        ),
+        (false, _, false) => format!(
+            "{} SELECT COUNT(*) FROM base_query{}{}",
+            i.base_sql, i.join_clause, i.where_clause
+        ),
+    }
+}
+
 fn build_inner_select(
     select_target: &str,
     join_clause: &str,
@@ -452,5 +491,91 @@ mod tests {
             .build();
 
         assert_eq!(result.table_alias, "custom_cte");
+    }
+
+    fn default_count_inputs<'a>(base_sql: &'a str, distinct_clause: &'a str) -> CountSqlInputs<'a> {
+        CountSqlInputs {
+            base_sql,
+            select_target: "\"base_query\".*",
+            distinct_clause,
+            join_clause: "",
+            where_clause: "",
+            group_by_clause: "",
+            outer_where_clause: "",
+            outer_group_by_clause_for_count: "",
+            has_outer_conditions: false,
+            has_outer_aggregation: false,
+            group_by_present: false,
+        }
+    }
+
+    #[test]
+    fn test_count_sql_without_distinct_uses_direct_count() {
+        let sql = build_count_sql(default_count_inputs("WITH base_query AS (SELECT 1)", ""));
+        assert!(
+            sql.ends_with("SELECT COUNT(*) FROM base_query"),
+            "plain count should hit fast path, got: {sql}"
+        );
+        assert!(!sql.contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn test_count_sql_with_distinct_wraps_subquery() {
+        let sql = build_count_sql(default_count_inputs(
+            "WITH base_query AS (SELECT 1)",
+            "DISTINCT ON (\"base_query\".\"id\") ",
+        ));
+        assert!(
+            sql.contains("DISTINCT ON (\"base_query\".\"id\")"),
+            "distinct count must carry DISTINCT ON into the subquery, got: {sql}"
+        );
+        assert!(
+            sql.contains("AS distinct_query"),
+            "distinct count must wrap in a subquery, got: {sql}"
+        );
+        assert!(sql.contains("SELECT COUNT(*) FROM ("));
+    }
+
+    #[test]
+    fn test_count_sql_with_distinct_and_outer_conditions_wraps_inner() {
+        let mut inputs = default_count_inputs(
+            "WITH base_query AS (SELECT 1)",
+            "DISTINCT ON (\"base_query\".\"id\") ",
+        );
+        inputs.has_outer_conditions = true;
+        inputs.outer_where_clause = " WHERE rn = 1";
+        let sql = build_count_sql(inputs);
+        assert!(sql.contains("DISTINCT ON (\"base_query\".\"id\")"));
+        assert!(sql.contains("AS inner_query"));
+        assert!(sql.contains(" WHERE rn = 1"));
+    }
+
+    #[test]
+    fn test_count_sql_with_distinct_and_group_by_uses_columns_not_one() {
+        let mut inputs = default_count_inputs(
+            "WITH base_query AS (SELECT 1)",
+            "DISTINCT ON (\"base_query\".\"id\") ",
+        );
+        inputs.group_by_present = true;
+        inputs.group_by_clause = " GROUP BY \"base_query\".\"id\"";
+        let sql = build_count_sql(inputs);
+        assert!(
+            sql.contains("DISTINCT ON (\"base_query\".\"id\") \"base_query\".*"),
+            "group-by + distinct must select real columns (not 1), got: {sql}"
+        );
+        assert!(sql.contains("AS grouped"));
+    }
+
+    #[test]
+    fn test_count_sql_group_by_without_distinct_uses_select_one() {
+        let mut inputs = default_count_inputs("WITH base_query AS (SELECT 1)", "");
+        inputs.group_by_present = true;
+        inputs.group_by_clause = " GROUP BY \"base_query\".\"id\"";
+        let sql = build_count_sql(inputs);
+        assert!(
+            sql.contains("SELECT 1 FROM base_query"),
+            "group-by-only fast path should SELECT 1, got: {sql}"
+        );
+        assert!(!sql.contains("DISTINCT ON"));
     }
 }
