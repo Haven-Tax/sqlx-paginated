@@ -369,7 +369,7 @@ where
         self
     }
 
-    /// Adds search functionality to the query by creating LIKE conditions for specified columns.
+    /// Adds search functionality to the query by creating `ILIKE` conditions for specified columns.
     ///
     /// # Arguments
     ///
@@ -378,7 +378,7 @@ where
     /// # Details
     ///
     /// - Only searches in columns that are both specified and considered safe
-    /// - Creates case-insensitive LIKE conditions with wildcards
+    /// - Case-insensitive pattern match via PostgreSQL `ILIKE` (with `%term%` binding)
     /// - Multiple search columns are combined with OR operators
     /// - Empty search text or no valid columns results in no conditions being added
     ///
@@ -422,11 +422,14 @@ where
                                 let placeholder = self.dialect.placeholder(next_argument);
                                 return if vc.column_type == FieldType::String {
                                     Some(format!(
-                                        "LOWER({}) LIKE LOWER({})",
+                                        "{} ILIKE {}",
                                         vc.expression, placeholder
                                     ))
                                 } else {
-                                    Some(format!("({})::text LIKE {}", vc.expression, placeholder))
+                                    Some(format!(
+                                        "({})::text ILIKE {}",
+                                        vc.expression, placeholder
+                                    ))
                                 };
                             }
 
@@ -457,12 +460,9 @@ where
                                 .unwrap_or_else(|| self.dialect.placeholder(next_argument));
 
                             if field_type == FieldType::String {
-                                Some(format!(
-                                    "LOWER({}) LIKE LOWER({})",
-                                    table_column, placeholder
-                                ))
+                                Some(format!("{} ILIKE {}", table_column, placeholder))
                             } else {
-                                Some(format!("{}::text LIKE {}", table_column, placeholder))
+                                Some(format!("{}::text ILIKE {}", table_column, placeholder))
                             }
                         })
                         .collect();
