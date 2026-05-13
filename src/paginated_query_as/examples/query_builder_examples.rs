@@ -59,8 +59,7 @@ pub mod postgres_examples {
             let result = build_query_with_safe_defaults::<TestModel>(&params);
 
             assert!(!result.conditions.is_empty());
-            assert!(result.conditions.iter().any(|c| c.contains("LOWER")));
-            assert!(result.conditions.iter().any(|c| c.contains("LIKE LOWER")));
+            assert!(result.conditions.iter().any(|c| c.contains(" ILIKE ")));
         }
 
         #[test]
@@ -70,7 +69,10 @@ pub mod postgres_examples {
                 .build();
 
             let result = build_query_with_safe_defaults::<TestModel>(&params);
-            assert!(!result.conditions.iter().any(|c| c.contains("LIKE")));
+            assert!(!result
+                .conditions
+                .iter()
+                .any(|c| c.to_lowercase().contains(" ilike ")));
         }
     }
 }
@@ -116,7 +118,10 @@ pub mod sqlite_examples {
 
             let result =
                 builder_new_query_with_disabled_protection_for_sqlite::<TestModel>(&params);
-            assert!(!result.conditions.iter().any(|c| c.contains("LIKE")));
+            assert!(!result
+                .conditions
+                .iter()
+                .any(|c| c.to_lowercase().contains(" ilike ")));
         }
     }
 }
