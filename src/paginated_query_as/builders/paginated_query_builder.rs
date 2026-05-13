@@ -427,7 +427,11 @@ fn build_count_sql(i: CountSqlInputs<'_>) -> String {
         (false, _, true) => format!(
             "{} SELECT COUNT(*) FROM (SELECT {} FROM base_query{}{}{}) AS grouped",
             i.base_sql,
-            if has_distinct { inner_select_target.as_str() } else { "1" },
+            if has_distinct {
+                inner_select_target.as_str()
+            } else {
+                "1"
+            },
             i.join_clause,
             i.where_clause,
             i.group_by_clause

@@ -1,10 +1,10 @@
 use crate::paginated_query_as::internal::{
     filters_deserialize, page_deserialize, page_size_deserialize, quote_identifier,
-    FilterParseError,
-    QueryPaginationParams, QuerySearchParams, QuerySortParams,
+    FilterParseError, QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+use std::str::FromStr;
 
 impl From<uuid::Uuid> for FilterValue {
     fn from(value: uuid::Uuid) -> Self {
@@ -52,10 +52,10 @@ pub struct FlatQueryParams {
     #[serde(flatten)]
     pub search: Option<QuerySearchParams>,
     #[serde(flatten, default, deserialize_with = "filters_deserialize")]
-    pub filters: Option<Vec<Filter>>,
+    pub filters: Option<FilterExpressionGroup>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum FilterOperator {
     Eq,
     Ne,
@@ -71,6 +71,51 @@ pub enum FilterOperator {
     IsNotNull,
     Between,
     Contains,
+}
+
+impl FilterOperator {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Eq => "Eq",
+            Self::Ne => "Ne",
+            Self::Gt => "Gt",
+            Self::Lt => "Lt",
+            Self::Gte => "Gte",
+            Self::Lte => "Lte",
+            Self::Like => "Like",
+            Self::ILike => "ILike",
+            Self::In => "In",
+            Self::NotIn => "NotIn",
+            Self::IsNull => "IsNull",
+            Self::IsNotNull => "IsNotNull",
+            Self::Between => "Between",
+            Self::Contains => "Contains",
+        }
+    }
+}
+
+impl FromStr for FilterOperator {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "Eq" => Ok(Self::Eq),
+            "Ne" => Ok(Self::Ne),
+            "Gt" => Ok(Self::Gt),
+            "Lt" => Ok(Self::Lt),
+            "Gte" => Ok(Self::Gte),
+            "Lte" => Ok(Self::Lte),
+            "Like" => Ok(Self::Like),
+            "ILike" => Ok(Self::ILike),
+            "In" => Ok(Self::In),
+            "NotIn" => Ok(Self::NotIn),
+            "IsNull" => Ok(Self::IsNull),
+            "IsNotNull" => Ok(Self::IsNotNull),
+            "Between" => Ok(Self::Between),
+            "Contains" => Ok(Self::Contains),
+            _ => Err(value.to_string()),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -161,6 +206,86 @@ pub struct Filter {
     pub value: FilterValue,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum LogicalOperator {
+    And,
+    Or,
+}
+
+impl LogicalOperator {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::And => "$and",
+            Self::Or => "$or",
+        }
+    }
+}
+
+impl FromStr for LogicalOperator {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "$and" => Ok(Self::And),
+            "$or" => Ok(Self::Or),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum FilterExpression {
+    Condition(Filter),
+    Group(FilterExpressionGroup),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FilterExpressionGroup {
+    pub operator: LogicalOperator,
+    pub children: Vec<FilterExpression>,
+}
+
+impl FilterExpressionGroup {
+    pub fn and(children: Vec<FilterExpression>) -> Self {
+        Self {
+            operator: LogicalOperator::And,
+            children,
+        }
+    }
+
+    pub fn or(children: Vec<FilterExpression>) -> Self {
+        Self {
+            operator: LogicalOperator::Or,
+            children,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    pub fn collect_conditions(&self) -> Vec<Filter> {
+        let mut filters = Vec::new();
+        self.collect_conditions_into(&mut filters);
+        filters
+    }
+
+    fn collect_conditions_into(&self, filters: &mut Vec<Filter>) {
+        for child in &self.children {
+            match child {
+                FilterExpression::Condition(filter) => filters.push(filter.clone()),
+                FilterExpression::Group(group) => group.collect_conditions_into(filters),
+            }
+        }
+    }
+}
+
+impl Default for FilterExpressionGroup {
+    fn default() -> Self {
+        Self::and(Vec::new())
+    }
+}
+
 /// Validated query parameters for paginated queries.
 ///
 /// Created from `FlatQueryParams` via `TryFrom`/`TryInto`.
@@ -169,7 +294,7 @@ pub struct QueryParams<'q, T> {
     pub pagination: Option<QueryPaginationParams>,
     pub sort: Option<QuerySortParams>,
     pub search: QuerySearchParams,
-    pub filters: Vec<Filter>,
+    pub filter_expression: FilterExpressionGroup,
     pub(crate) _phantom: PhantomData<&'q T>,
 }
 
@@ -179,7 +304,7 @@ impl<'q, T> Default for QueryParams<'q, T> {
             pagination: None,
             sort: None,
             search: QuerySearchParams::default(),
-            filters: Vec::new(),
+            filter_expression: FilterExpressionGroup::default(),
             _phantom: PhantomData,
         }
     }
@@ -208,7 +333,7 @@ impl<'q, T> TryFrom<FlatQueryParams> for QueryParams<'q, T> {
             pagination,
             sort: params.sort,
             search: params.search.unwrap_or_default(),
-            filters: params.filters.unwrap_or_default(),
+            filter_expression: params.filters.unwrap_or_default(),
             _phantom: PhantomData,
         })
     }

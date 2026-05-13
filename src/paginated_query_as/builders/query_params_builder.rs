@@ -1,7 +1,10 @@
 use crate::paginated_query_as::internal::{
     FilterParseError, QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
-use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue, QuerySortDirection};
+use crate::paginated_query_as::models::{
+    Filter, FilterExpression, FilterExpressionGroup, FilterOperator, FilterValue,
+    QuerySortDirection,
+};
 use crate::QueryParams;
 use serde::Serialize;
 
@@ -208,11 +211,14 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
         operator: FilterOperator,
         value: FilterValue,
     ) -> Self {
-        self.query.filters.push(Filter {
-            field: field.into(),
-            operator,
-            value,
-        });
+        self.query
+            .filter_expression
+            .children
+            .push(FilterExpression::Condition(Filter {
+                field: field.into(),
+                operator,
+                value,
+            }));
         self
     }
 
@@ -274,7 +280,39 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     ///     .build();
     /// ```
     pub fn with_filters(mut self, filters: Vec<Filter>) -> Self {
-        self.query.filters.extend(filters);
+        self.query
+            .filter_expression
+            .children
+            .extend(filters.iter().cloned().map(FilterExpression::Condition));
+        self
+    }
+
+    /// Adds a grouped filter expression.
+    ///
+    /// The root query filter expression is always an AND group, so this expression
+    /// is added as one child alongside any flat filters.
+    pub fn with_filter_expression(mut self, expression: FilterExpression) -> Self {
+        self.query.filter_expression.children.push(expression);
+        self
+    }
+
+    /// Adds an AND group as a child of the root AND filter group.
+    pub fn with_and_filters(mut self, children: Vec<FilterExpression>) -> Self {
+        self.query
+            .filter_expression
+            .children
+            .push(FilterExpression::Group(FilterExpressionGroup::and(
+                children,
+            )));
+        self
+    }
+
+    /// Adds an OR group as a child of the root AND filter group.
+    pub fn with_or_filters(mut self, children: Vec<FilterExpression>) -> Self {
+        self.query
+            .filter_expression
+            .children
+            .push(FilterExpression::Group(FilterExpressionGroup::or(children)));
         self
     }
 
@@ -321,6 +359,10 @@ mod tests {
         description: String,
         status: String,
         category: String,
+    }
+
+    fn collect_filters<T>(params: &QueryParams<T>) -> Vec<Filter> {
+        params.filter_expression.collect_conditions()
     }
 
     #[test]
@@ -381,7 +423,7 @@ mod tests {
             .with_search("test".to_string(), vec!["name".to_string()])
             .build();
 
-        let pagination = params.pagination.unwrap();
+        let pagination = params.pagination.as_ref().unwrap();
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 10);
         assert_eq!(params.search.search, Some("test".to_string()));
@@ -447,13 +489,11 @@ mod tests {
             )
             .build();
 
-        assert_eq!(params.filters.len(), 2);
-        assert_eq!(params.filters[0].field, "status");
-        assert_eq!(params.filters[0].operator, FilterOperator::Eq);
-        assert_eq!(
-            params.filters[0].value,
-            FilterValue::String("active".to_string())
-        );
+        let filters = collect_filters(&params);
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].field, "status");
+        assert_eq!(filters[0].operator, FilterOperator::Eq);
+        assert_eq!(filters[0].value, FilterValue::String("active".to_string()));
     }
 
     #[test]
@@ -462,13 +502,11 @@ mod tests {
             .with_eq_filter("status", "active")
             .build();
 
-        assert_eq!(params.filters.len(), 1);
-        assert_eq!(params.filters[0].field, "status");
-        assert_eq!(params.filters[0].operator, FilterOperator::Eq);
-        assert_eq!(
-            params.filters[0].value,
-            FilterValue::String("active".to_string())
-        );
+        let filters = collect_filters(&params);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].field, "status");
+        assert_eq!(filters[0].operator, FilterOperator::Eq);
+        assert_eq!(filters[0].value, FilterValue::String("active".to_string()));
     }
 
     #[test]
@@ -500,7 +538,7 @@ mod tests {
             .with_eq_filter("status", "active")
             .build();
 
-        let pagination = params.pagination.unwrap();
+        let pagination = params.pagination.as_ref().unwrap();
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 20);
         assert_eq!(
@@ -516,7 +554,7 @@ mod tests {
             params.search.search_columns,
             Some(vec!["title".to_string(), "description".to_string()])
         );
-        assert_eq!(params.filters.len(), 1);
+        assert_eq!(collect_filters(&params).len(), 1);
     }
 
     #[test]
@@ -526,9 +564,10 @@ mod tests {
             .with_eq_filter("category", "test")
             .build();
 
-        assert_eq!(params.filters.len(), 2);
-        assert_eq!(params.filters[0].field, "status");
-        assert_eq!(params.filters[1].field, "category");
+        let filters = collect_filters(&params);
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].field, "status");
+        assert_eq!(filters[1].field, "category");
     }
 
     #[test]
@@ -540,11 +579,11 @@ mod tests {
             .with_eq_filter("status", "active")
             .build();
 
-        let pagination = params.pagination.unwrap();
+        let pagination = params.pagination.as_ref().unwrap();
         assert_eq!(pagination.page, 2);
         assert_eq!(pagination.page_size, 10);
         assert_eq!(params.search.search, Some("test".to_string()));
-        assert_eq!(params.filters.len(), 1);
+        assert_eq!(collect_filters(&params).len(), 1);
     }
 
     #[test]
@@ -553,12 +592,13 @@ mod tests {
             .with_eq_filter("any_column", "value")
             .build();
 
+        let filters = collect_filters(&params);
         assert_eq!(
-            params.filters.len(),
+            filters.len(),
             1,
             "Filter should be passed through for QueryBuilder validation"
         );
-        assert_eq!(params.filters[0].field, "any_column");
+        assert_eq!(filters[0].field, "any_column");
     }
 
     #[test]
@@ -576,8 +616,9 @@ mod tests {
             )
             .build();
 
-        assert_eq!(params.filters.len(), 2);
-        assert_eq!(params.filters[0].operator, FilterOperator::Ne);
-        assert_eq!(params.filters[1].operator, FilterOperator::Like);
+        let filters = collect_filters(&params);
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].operator, FilterOperator::Ne);
+        assert_eq!(filters[1].operator, FilterOperator::Like);
     }
 }

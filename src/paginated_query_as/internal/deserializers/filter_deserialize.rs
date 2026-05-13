@@ -1,30 +1,20 @@
 use super::FilterParseError;
-use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue};
+use crate::paginated_query_as::models::{
+    Filter, FilterExpression, FilterExpressionGroup, FilterOperator, FilterValue, LogicalOperator,
+};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::{de::Error, Deserialize, Deserializer};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-/// Parses a string into a FilterOperator enum variant.
-/// Returns Err with the raw operator string if invalid.
-fn parse_operator(s: &str) -> Result<FilterOperator, String> {
-    match s {
-        "Eq" => Ok(FilterOperator::Eq),
-        "Ne" => Ok(FilterOperator::Ne),
-        "Gt" => Ok(FilterOperator::Gt),
-        "Lt" => Ok(FilterOperator::Lt),
-        "Gte" => Ok(FilterOperator::Gte),
-        "Lte" => Ok(FilterOperator::Lte),
-        "Like" => Ok(FilterOperator::Like),
-        "ILike" => Ok(FilterOperator::ILike),
-        "In" => Ok(FilterOperator::In),
-        "NotIn" => Ok(FilterOperator::NotIn),
-        "IsNull" => Ok(FilterOperator::IsNull),
-        "IsNotNull" => Ok(FilterOperator::IsNotNull),
-        "Between" => Ok(FilterOperator::Between),
-        "Contains" => Ok(FilterOperator::Contains),
-        _ => Err(s.to_string()),
-    }
-}
+const RESERVED_QUERY_PARAMS: &[&str] = &[
+    "page",
+    "page_size",
+    "sort_column",
+    "sort_direction",
+    "search",
+    "search_columns",
+];
 
 /// Parses a string value into a FilterValue with automatic type inference.
 /// Type inference order: Bool -> Uuid -> DateTime -> Date -> Time -> Int -> Float -> String
@@ -91,7 +81,203 @@ fn parse_array_values(s: &str) -> Vec<FilterValue> {
     s.split(',').map(|v| parse_filter_value(v.trim())).collect()
 }
 
-/// Deserializes query parameters into a Vec<Filter>.
+fn filter_value_from_json(value: &Value) -> FilterValue {
+    match value {
+        Value::Null => FilterValue::Null,
+        Value::Bool(value) => FilterValue::Bool(*value),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                FilterValue::Int(value)
+            } else if let Some(value) = value.as_f64() {
+                FilterValue::Float(value)
+            } else {
+                FilterValue::String(value.to_string())
+            }
+        }
+        Value::String(value) => parse_filter_value(value),
+        Value::Array(values) => {
+            FilterValue::Array(values.iter().map(filter_value_from_json).collect())
+        }
+        Value::Object(_) => FilterValue::String(value.to_string()),
+    }
+}
+
+fn filter_value_for_operator(operator: FilterOperator, value: &Value) -> FilterValue {
+    match operator {
+        FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
+        FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
+            match filter_value_from_json(value) {
+                FilterValue::Array(values) => FilterValue::Array(values),
+                value => FilterValue::Array(vec![value]),
+            }
+        }
+        _ => filter_value_from_json(value),
+    }
+}
+
+fn parse_filter_from_raw(field: &str, raw_value: &str) -> Result<Filter, FilterParseError> {
+    let (operator_str, value_str) =
+        raw_value
+            .split_once(':')
+            .ok_or_else(|| FilterParseError::InvalidFilterFormat {
+                field: field.to_string(),
+                raw_value: raw_value.to_string(),
+            })?;
+
+    let operator = operator_str
+        .parse::<FilterOperator>()
+        .map_err(|raw_operator| FilterParseError::InvalidOperator {
+            field: field.to_string(),
+            raw_operator,
+        })?;
+
+    let value = match operator {
+        FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
+        FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
+            FilterValue::Array(parse_array_values(value_str))
+        }
+        _ => parse_filter_value(value_str),
+    };
+
+    Ok(Filter {
+        field: field.to_string(),
+        operator,
+        value,
+    })
+}
+
+fn filter_expression(field: &str, operator: FilterOperator, value: &Value) -> FilterExpression {
+    FilterExpression::Condition(Filter {
+        field: field.to_string(),
+        operator,
+        value: filter_value_for_operator(operator, value),
+    })
+}
+
+fn parse_field_expression(
+    field: &str,
+    value: &Value,
+) -> Result<Vec<FilterExpression>, FilterParseError> {
+    match value {
+        Value::Object(operators) if !operators.is_empty() => operators
+            .iter()
+            .map(|(operator, value)| {
+                operator
+                    .parse::<FilterOperator>()
+                    .map(|operator| filter_expression(field, operator, value))
+                    .map_err(|raw_operator| FilterParseError::InvalidOperator {
+                        field: field.to_string(),
+                        raw_operator,
+                    })
+            })
+            .collect(),
+        _ => Ok(vec![filter_expression(field, FilterOperator::Eq, value)]),
+    }
+}
+
+fn parse_logical_group(
+    operator: LogicalOperator,
+    value: &Value,
+) -> Result<FilterExpression, FilterParseError> {
+    let Value::Array(items) = value else {
+        return Err(FilterParseError::InvalidLogicalFilter {
+            path: operator.as_str().to_string(),
+            reason: "expected an array".to_string(),
+        });
+    };
+
+    let children = items
+        .iter()
+        .map(parse_expression_value)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(FilterExpression::Group(FilterExpressionGroup {
+        operator,
+        children,
+    }))
+}
+
+fn parse_expression_object(map: &Map<String, Value>) -> Result<FilterExpression, FilterParseError> {
+    let mut children = Vec::new();
+
+    for (field, value) in map {
+        if let Ok(operator) = field.parse::<LogicalOperator>() {
+            children.push(parse_logical_group(operator, value)?);
+        } else {
+            children.extend(parse_field_expression(field, value)?);
+        }
+    }
+
+    match children.len() {
+        0 => Ok(FilterExpression::Group(FilterExpressionGroup::default())),
+        1 => Ok(children.remove(0)),
+        _ => Ok(FilterExpression::Group(FilterExpressionGroup::and(
+            children,
+        ))),
+    }
+}
+
+fn parse_expression_value(value: &Value) -> Result<FilterExpression, FilterParseError> {
+    let Value::Object(map) = value else {
+        return Err(FilterParseError::InvalidLogicalFilter {
+            path: value.to_string(),
+            reason: "expected an object".to_string(),
+        });
+    };
+
+    parse_expression_object(map)
+}
+
+fn parse_bracket_path(field: &str) -> Option<Vec<&str>> {
+    let (root, _) = field.split_once('[')?;
+    root.parse::<LogicalOperator>().ok()?;
+
+    let mut tokens = vec![root];
+    let mut rest = &field[root.len()..];
+
+    while let Some(stripped) = rest.strip_prefix('[') {
+        let (token, next) = stripped.split_once(']')?;
+        if token.is_empty() {
+            return None;
+        }
+        tokens.push(token);
+        rest = next;
+    }
+
+    rest.is_empty().then_some(tokens)
+}
+
+fn insert_bracket_value(root: &mut Value, path: &[&str], value: Value) {
+    let Some((head, tail)) = path.split_first() else {
+        *root = value;
+        return;
+    };
+
+    if let Ok(index) = head.parse::<usize>() {
+        if !root.is_array() {
+            *root = Value::Array(Vec::new());
+        }
+        let items = root.as_array_mut().expect("root was just made an array");
+        items.resize(index + 1, Value::Null);
+        insert_bracket_value(&mut items[index], tail, value);
+    } else {
+        if !root.is_object() {
+            *root = Value::Object(Map::new());
+        }
+        let entry = root
+            .as_object_mut()
+            .expect("root was just made an object")
+            .entry((*head).to_string())
+            .or_insert(Value::Null);
+        insert_bracket_value(entry, tail, value);
+    }
+}
+
+fn parse_query_value(value: String) -> Value {
+    serde_json::from_str(&value).unwrap_or(Value::String(value))
+}
+
+/// Deserializes query parameters into a root AND filter expression group.
 ///
 /// Expected format: `field=Operator:value`
 /// Examples:
@@ -99,7 +285,9 @@ fn parse_array_values(s: &str) -> Vec<FilterValue> {
 /// - `?age=Gt:18` -> Filter { field: "age", operator: Gt, value: Int(18) }
 /// - `?status=In:Active,Pending` -> Filter { field: "status", operator: In, value: Array([...]) }
 /// - `?deleted_at=IsNull:` -> Filter { field: "deleted_at", operator: IsNull, value: Null }
-pub fn filters_deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<Filter>>, D::Error>
+pub fn filters_deserialize<'de, D>(
+    deserializer: D,
+) -> Result<Option<FilterExpressionGroup>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -111,73 +299,101 @@ where
         Some(m) => m,
     };
 
-    let mut filters = Vec::new();
+    let mut children = Vec::new();
+    let mut bracket_filters = Value::Object(Map::new());
 
     for (field, raw_value) in map {
-        if matches!(
-            field.as_str(),
-            "page" | "page_size" | "sort_column" | "sort_direction" | "search" | "search_columns"
-        ) {
+        if RESERVED_QUERY_PARAMS.contains(&field.as_str()) {
             continue;
         }
 
-        let (operator_str, value_str) = raw_value.split_once(':').ok_or_else(|| {
-            D::Error::custom(FilterParseError::InvalidFilterFormat {
-                field: field.clone(),
-                raw_value: raw_value.clone(),
-            })
-        })?;
+        if let Some(path) = parse_bracket_path(&field) {
+            insert_bracket_value(&mut bracket_filters, &path, parse_query_value(raw_value));
+            continue;
+        }
 
-        let operator = parse_operator(operator_str).map_err(|raw_op| {
-            D::Error::custom(FilterParseError::InvalidOperator {
-                field: field.clone(),
-                raw_operator: raw_op,
-            })
-        })?;
-
-        let value = match operator {
-            FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
-            FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
-                FilterValue::Array(parse_array_values(value_str))
-            }
-            _ => parse_filter_value(value_str),
-        };
-
-        filters.push(Filter {
-            field,
-            operator,
-            value,
-        });
+        let filter = parse_filter_from_raw(&field, &raw_value).map_err(D::Error::custom)?;
+        children.push(FilterExpression::Condition(filter));
     }
 
-    if filters.is_empty() {
+    if bracket_filters
+        .as_object()
+        .is_some_and(|map| !map.is_empty())
+    {
+        children.push(parse_expression_value(&bracket_filters).map_err(D::Error::custom)?);
+    }
+
+    if children.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(filters))
+        Ok(Some(FilterExpressionGroup::and(children)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestParams {
+        #[serde(flatten, default, deserialize_with = "filters_deserialize")]
+        filters: Option<FilterExpressionGroup>,
+    }
 
     #[test]
     fn test_parse_operator() {
-        assert_eq!(parse_operator("Eq"), Ok(FilterOperator::Eq));
-        assert_eq!(parse_operator("Ne"), Ok(FilterOperator::Ne));
-        assert_eq!(parse_operator("Gt"), Ok(FilterOperator::Gt));
-        assert_eq!(parse_operator("Lt"), Ok(FilterOperator::Lt));
-        assert_eq!(parse_operator("Gte"), Ok(FilterOperator::Gte));
-        assert_eq!(parse_operator("Lte"), Ok(FilterOperator::Lte));
-        assert_eq!(parse_operator("Like"), Ok(FilterOperator::Like));
-        assert_eq!(parse_operator("ILike"), Ok(FilterOperator::ILike));
-        assert_eq!(parse_operator("In"), Ok(FilterOperator::In));
-        assert_eq!(parse_operator("NotIn"), Ok(FilterOperator::NotIn));
-        assert_eq!(parse_operator("IsNull"), Ok(FilterOperator::IsNull));
-        assert_eq!(parse_operator("IsNotNull"), Ok(FilterOperator::IsNotNull));
-        assert_eq!(parse_operator("Between"), Ok(FilterOperator::Between));
-        assert_eq!(parse_operator("Contains"), Ok(FilterOperator::Contains));
-        assert_eq!(parse_operator("Invalid"), Err("Invalid".to_string()));
+        assert_eq!("Eq".parse(), Ok(FilterOperator::Eq));
+        assert_eq!("Ne".parse(), Ok(FilterOperator::Ne));
+        assert_eq!("Gt".parse(), Ok(FilterOperator::Gt));
+        assert_eq!("Lt".parse(), Ok(FilterOperator::Lt));
+        assert_eq!("Gte".parse(), Ok(FilterOperator::Gte));
+        assert_eq!("Lte".parse(), Ok(FilterOperator::Lte));
+        assert_eq!("Like".parse(), Ok(FilterOperator::Like));
+        assert_eq!("ILike".parse(), Ok(FilterOperator::ILike));
+        assert_eq!("In".parse(), Ok(FilterOperator::In));
+        assert_eq!("NotIn".parse(), Ok(FilterOperator::NotIn));
+        assert_eq!("IsNull".parse(), Ok(FilterOperator::IsNull));
+        assert_eq!("IsNotNull".parse(), Ok(FilterOperator::IsNotNull));
+        assert_eq!("Between".parse(), Ok(FilterOperator::Between));
+        assert_eq!("Contains".parse(), Ok(FilterOperator::Contains));
+        assert_eq!(
+            "Invalid".parse::<FilterOperator>(),
+            Err("Invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn test_flat_filters_deserialize_into_root_and_group() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "status": "Eq:active",
+            "age": "Gte:18"
+        }))
+        .unwrap();
+
+        let group = params.filters.unwrap();
+        assert_eq!(group.operator, LogicalOperator::And);
+        assert_eq!(group.children.len(), 2);
+    }
+
+    #[test]
+    fn test_bracket_logical_filters_deserialize() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "$and[0][$or][0][username][Eq]": "phiberber",
+            "$and[0][$or][1][age][Gte]": "18",
+            "$and[1][organizationId]": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.children.len(), 1);
+
+        let FilterExpression::Group(and_group) = &root.children[0] else {
+            panic!("expected nested AND group");
+        };
+        assert_eq!(and_group.operator, LogicalOperator::And);
+        assert_eq!(and_group.children.len(), 2);
     }
 
     #[test]

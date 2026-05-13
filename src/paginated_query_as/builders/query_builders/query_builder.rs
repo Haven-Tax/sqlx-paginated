@@ -3,7 +3,8 @@ use crate::paginated_query_as::internal::{
     VirtualColumnBuilder,
 };
 use crate::paginated_query_as::models::{
-    FilterOperator, FilterValue, QueryParams, QuerySortDirection, SortEntry, SortItem,
+    Filter, FilterExpression, FilterExpressionGroup, FilterOperator, FilterValue, LogicalOperator,
+    QueryParams, QuerySortDirection, SortEntry, SortItem,
 };
 use serde::Serialize;
 use sqlx::{Arguments, Database, Encode, Type};
@@ -520,184 +521,216 @@ where
     ///     .build();
     /// ```
     pub fn with_filters(mut self, params: &QueryParams<T>) -> Self {
-        for filter in &params.filters {
-            let field = &filter.field;
-
-            // Check for virtual column first
-            let (table_column, field_type) = if let Some(vc) =
-                self.virtual_columns.get(field).cloned()
-            {
-                self.activate_joins(&vc);
-                (vc.expression.clone(), vc.column_type.clone())
-            } else {
-                if !self.is_column_safe(field) {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
-                    continue;
-                }
-                (
-                    self.format_column(field),
-                    self.field_meta
-                        .get(field)
-                        .cloned()
-                        .unwrap_or(FieldType::Unknown),
-                )
-            };
-
-            // Type resolution order (highest priority first):
-            // 1. Explicit column_cast_overrides (from with_column_cast)
-            // 2. Virtual column or field_meta type (if not Unknown)
-            // 3. Filter value type inference (fallback when type is Unknown)
-            let filter_value_type = filter.value.to_field_type();
-
-            let mut effective_field_type =
-                if let Some(override_type) = self.column_cast_overrides.get(field) {
-                    override_type.clone()
-                } else if field_type == FieldType::Unknown {
-                    filter_value_type.clone()
-                } else {
-                    field_type.clone()
-                };
-
-            // Down casting DateTime to Date for proper comparison
-            if effective_field_type == FieldType::DateTime && filter_value_type == FieldType::Date {
-                effective_field_type = FieldType::Date;
-            }
-
-            let type_cast = self.dialect.type_cast(&effective_field_type);
-            // If the filter value is a Date, cast the column to date for proper comparison
-            // This ensures timestamp columns match all records on that calendar day
-            let column_expr = if effective_field_type == FieldType::Date {
-                format!("{}::date", table_column)
-            } else {
-                table_column.clone()
-            };
-
-            let condition = match filter.operator {
-                FilterOperator::Eq => {
-                    if let FilterValue::Bool(b) = filter.value {
-                        let bool_literal = if b { "TRUE" } else { "FALSE" };
-                        format!("{} IS {}", column_expr, bool_literal)
-                    } else {
-                        let value = filter.value.to_bindable_string();
-                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                        self.arguments.add(value).unwrap_or_default();
-                        format!("{} = {}{}", column_expr, placeholder, type_cast)
-                    }
-                }
-                FilterOperator::Ne => {
-                    if let FilterValue::Bool(b) = filter.value {
-                        let bool_literal = if b { "TRUE" } else { "FALSE" };
-                        format!("{} IS NOT {}", column_expr, bool_literal)
-                    } else {
-                        let value = filter.value.to_bindable_string();
-                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                        self.arguments.add(value).unwrap_or_default();
-                        format!("{} <> {}{}", column_expr, placeholder, type_cast)
-                    }
-                }
-                FilterOperator::Gt => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} > {}{}", column_expr, placeholder, type_cast)
-                }
-                FilterOperator::Lt => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} < {}{}", column_expr, placeholder, type_cast)
-                }
-                FilterOperator::Gte => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} >= {}{}", column_expr, placeholder, type_cast)
-                }
-                FilterOperator::Lte => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} <= {}{}", column_expr, placeholder, type_cast)
-                }
-                FilterOperator::Like => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    // Cast column to text for pattern matching on non-text types
-                    if effective_field_type != FieldType::String
-                        && effective_field_type != FieldType::Unknown
-                    {
-                        format!("{}::text LIKE {}", table_column, placeholder)
-                    } else {
-                        format!("{} LIKE {}", table_column, placeholder)
-                    }
-                }
-                FilterOperator::ILike => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    // Cast column to text for pattern matching on non-text types
-                    if effective_field_type != FieldType::String
-                        && effective_field_type != FieldType::Unknown
-                    {
-                        format!("{}::text ILIKE {}", table_column, placeholder)
-                    } else {
-                        format!("{} ILIKE {}", table_column, placeholder)
-                    }
-                }
-                FilterOperator::In => {
-                    let values = filter.value.to_bindable_strings();
-                    let placeholders: Vec<String> = values
-                        .iter()
-                        .map(|v| {
-                            let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                            self.arguments.add(v.clone()).unwrap_or_default();
-                            format!("{}{}", placeholder, type_cast)
-                        })
-                        .collect();
-                    format!("{} IN ({})", column_expr, placeholders.join(", "))
-                }
-                FilterOperator::NotIn => {
-                    let values = filter.value.to_bindable_strings();
-                    let placeholders: Vec<String> = values
-                        .iter()
-                        .map(|v| {
-                            let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                            self.arguments.add(v.clone()).unwrap_or_default();
-                            format!("{}{}", placeholder, type_cast)
-                        })
-                        .collect();
-                    format!("{} NOT IN ({})", column_expr, placeholders.join(", "))
-                }
-                FilterOperator::IsNull => format!("{} IS NULL", table_column),
-                FilterOperator::IsNotNull => format!("{} IS NOT NULL", table_column),
-                FilterOperator::Between => {
-                    let values = filter.value.to_bindable_strings();
-                    if values.len() >= 2 {
-                        let placeholder1 = self.dialect.placeholder(self.arguments.len() + 1);
-                        self.arguments.add(values[0].clone()).unwrap_or_default();
-                        let placeholder2 = self.dialect.placeholder(self.arguments.len() + 1);
-                        self.arguments.add(values[1].clone()).unwrap_or_default();
-                        format!(
-                            "{} BETWEEN {}{} AND {}{}",
-                            column_expr, placeholder1, type_cast, placeholder2, type_cast
-                        )
-                    } else {
-                        continue;
-                    }
-                }
-                FilterOperator::Contains => {
-                    let value = filter.value.to_bindable_string();
-                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
-                    self.arguments.add(value).unwrap_or_default();
-                    format!("{} @> {}{}", table_column, placeholder, type_cast)
-                }
-            };
-
+        if let Some(condition) = self.build_filter_group_condition(&params.filter_expression) {
             self.conditions.push(condition);
         }
         self
+    }
+
+    fn build_filter_expression_condition(
+        &mut self,
+        expression: &FilterExpression,
+    ) -> Option<String> {
+        match expression {
+            FilterExpression::Condition(filter) => self.build_filter_condition(filter),
+            FilterExpression::Group(group) => self.build_filter_group_condition(group),
+        }
+    }
+
+    fn build_filter_group_condition(&mut self, group: &FilterExpressionGroup) -> Option<String> {
+        let conditions = group
+            .children
+            .iter()
+            .filter_map(|expression| self.build_filter_expression_condition(expression))
+            .collect::<Vec<_>>();
+
+        if conditions.is_empty() {
+            return None;
+        }
+
+        let joiner = match group.operator {
+            LogicalOperator::And => " AND ",
+            LogicalOperator::Or => " OR ",
+        };
+
+        Some(format!("({})", conditions.join(joiner)))
+    }
+
+    fn build_filter_condition(&mut self, filter: &Filter) -> Option<String> {
+        let field = &filter.field;
+
+        // Check for virtual column first
+        let (table_column, field_type) = if let Some(vc) = self.virtual_columns.get(field).cloned()
+        {
+            self.activate_joins(&vc);
+            (vc.expression.clone(), vc.column_type.clone())
+        } else {
+            if !self.is_column_safe(field) {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
+                return None;
+            }
+            (
+                self.format_column(field),
+                self.field_meta
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(FieldType::Unknown),
+            )
+        };
+
+        // Type resolution order (highest priority first):
+        // 1. Explicit column_cast_overrides (from with_column_cast)
+        // 2. Virtual column or field_meta type (if not Unknown)
+        // 3. Filter value type inference (fallback when type is Unknown)
+        let filter_value_type = filter.value.to_field_type();
+
+        let mut effective_field_type =
+            if let Some(override_type) = self.column_cast_overrides.get(field) {
+                override_type.clone()
+            } else if field_type == FieldType::Unknown {
+                filter_value_type.clone()
+            } else {
+                field_type.clone()
+            };
+
+        // Down casting DateTime to Date for proper comparison
+        if effective_field_type == FieldType::DateTime && filter_value_type == FieldType::Date {
+            effective_field_type = FieldType::Date;
+        }
+
+        let type_cast = self.dialect.type_cast(&effective_field_type);
+        // If the filter value is a Date, cast the column to date for proper comparison
+        // This ensures timestamp columns match all records on that calendar day
+        let column_expr = if effective_field_type == FieldType::Date {
+            format!("{}::date", table_column)
+        } else {
+            table_column.clone()
+        };
+
+        let condition = match filter.operator {
+            FilterOperator::Eq => {
+                if let FilterValue::Bool(b) = &filter.value {
+                    let bool_literal = if *b { "TRUE" } else { "FALSE" };
+                    format!("{} IS {}", column_expr, bool_literal)
+                } else {
+                    let value = filter.value.to_bindable_string();
+                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                    self.arguments.add(value).unwrap_or_default();
+                    format!("{} = {}{}", column_expr, placeholder, type_cast)
+                }
+            }
+            FilterOperator::Ne => {
+                if let FilterValue::Bool(b) = &filter.value {
+                    let bool_literal = if *b { "TRUE" } else { "FALSE" };
+                    format!("{} IS NOT {}", column_expr, bool_literal)
+                } else {
+                    let value = filter.value.to_bindable_string();
+                    let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                    self.arguments.add(value).unwrap_or_default();
+                    format!("{} <> {}{}", column_expr, placeholder, type_cast)
+                }
+            }
+            FilterOperator::Gt => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                format!("{} > {}{}", column_expr, placeholder, type_cast)
+            }
+            FilterOperator::Lt => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                format!("{} < {}{}", column_expr, placeholder, type_cast)
+            }
+            FilterOperator::Gte => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                format!("{} >= {}{}", column_expr, placeholder, type_cast)
+            }
+            FilterOperator::Lte => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                format!("{} <= {}{}", column_expr, placeholder, type_cast)
+            }
+            FilterOperator::Like => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                // Cast column to text for pattern matching on non-text types
+                if effective_field_type != FieldType::String
+                    && effective_field_type != FieldType::Unknown
+                {
+                    format!("{}::text LIKE {}", table_column, placeholder)
+                } else {
+                    format!("{} LIKE {}", table_column, placeholder)
+                }
+            }
+            FilterOperator::ILike => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                // Cast column to text for pattern matching on non-text types
+                if effective_field_type != FieldType::String
+                    && effective_field_type != FieldType::Unknown
+                {
+                    format!("{}::text ILIKE {}", table_column, placeholder)
+                } else {
+                    format!("{} ILIKE {}", table_column, placeholder)
+                }
+            }
+            FilterOperator::In => {
+                let values = filter.value.to_bindable_strings();
+                let placeholders: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                        self.arguments.add(v.clone()).unwrap_or_default();
+                        format!("{}{}", placeholder, type_cast)
+                    })
+                    .collect();
+                format!("{} IN ({})", column_expr, placeholders.join(", "))
+            }
+            FilterOperator::NotIn => {
+                let values = filter.value.to_bindable_strings();
+                let placeholders: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                        self.arguments.add(v.clone()).unwrap_or_default();
+                        format!("{}{}", placeholder, type_cast)
+                    })
+                    .collect();
+                format!("{} NOT IN ({})", column_expr, placeholders.join(", "))
+            }
+            FilterOperator::IsNull => format!("{} IS NULL", table_column),
+            FilterOperator::IsNotNull => format!("{} IS NOT NULL", table_column),
+            FilterOperator::Between => {
+                let values = filter.value.to_bindable_strings();
+                if values.len() >= 2 {
+                    let placeholder1 = self.dialect.placeholder(self.arguments.len() + 1);
+                    self.arguments.add(values[0].clone()).unwrap_or_default();
+                    let placeholder2 = self.dialect.placeholder(self.arguments.len() + 1);
+                    self.arguments.add(values[1].clone()).unwrap_or_default();
+                    format!(
+                        "{} BETWEEN {}{} AND {}{}",
+                        column_expr, placeholder1, type_cast, placeholder2, type_cast
+                    )
+                } else {
+                    return None;
+                }
+            }
+            FilterOperator::Contains => {
+                let value = filter.value.to_bindable_string();
+                let placeholder = self.dialect.placeholder(self.arguments.len() + 1);
+                self.arguments.add(value).unwrap_or_default();
+                format!("{} @> {}{}", table_column, placeholder, type_cast)
+            }
+        };
+
+        Some(condition)
     }
 
     /// Adds a custom condition for a specific column with a provided operator and value.
@@ -974,7 +1007,7 @@ where
             self.activate_joins(&vc);
             return self.with_sort(SortItem::expression(&vc.expression), direction);
         }
-        
+
         self.with_sort(SortItem::column(column), direction)
     }
 
@@ -1083,8 +1116,17 @@ mod tests {
     }
 
     fn make_params_with_filter(filter: Filter) -> QueryParams<'static, TestModel> {
+        make_params_with_filters(vec![filter])
+    }
+
+    fn make_params_with_filters(filters: Vec<Filter>) -> QueryParams<'static, TestModel> {
         QueryParams {
-            filters: vec![filter],
+            filter_expression: FilterExpressionGroup::and(
+                filters
+                    .into_iter()
+                    .map(FilterExpression::Condition)
+                    .collect(),
+            ),
             ..Default::default()
         }
     }
@@ -1092,8 +1134,19 @@ mod tests {
     fn make_option_params_with_filter(
         filter: Filter,
     ) -> QueryParams<'static, TestModelWithOptions> {
+        make_option_params_with_filters(vec![filter])
+    }
+
+    fn make_option_params_with_filters(
+        filters: Vec<Filter>,
+    ) -> QueryParams<'static, TestModelWithOptions> {
         QueryParams {
-            filters: vec![filter],
+            filter_expression: FilterExpressionGroup::and(
+                filters
+                    .into_iter()
+                    .map(FilterExpression::Condition)
+                    .collect(),
+            ),
             ..Default::default()
         }
     }
@@ -1101,6 +1154,37 @@ mod tests {
     // ========================================
     // Type Cast Tests for Comparison Operators
     // ========================================
+
+    #[test]
+    fn test_logical_or_filter_group_generates_grouped_condition() {
+        let params = QueryParams::<TestModel> {
+            filter_expression: FilterExpressionGroup::and(vec![FilterExpression::Group(
+                FilterExpressionGroup::or(vec![
+                    FilterExpression::Condition(Filter {
+                        field: "name".to_string(),
+                        operator: FilterOperator::Eq,
+                        value: FilterValue::String("phiberber".to_string()),
+                    }),
+                    FilterExpression::Condition(Filter {
+                        field: "id".to_string(),
+                        operator: FilterOperator::Gte,
+                        value: FilterValue::Int(18),
+                    }),
+                ]),
+            )]),
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build();
+
+        assert_eq!(result.conditions.len(), 1);
+        assert!(result.conditions[0].contains(" OR "));
+        assert!(result.conditions[0].contains("$1"));
+        assert!(result.conditions[0].contains("$2::bigint"));
+        assert_eq!(result.arguments.len(), 2);
+    }
 
     #[test]
     fn test_eq_filter_int_generates_bigint_cast() {
@@ -1271,10 +1355,7 @@ mod tests {
             operator: FilterOperator::Eq,
             value: FilterValue::Int(123),
         };
-        let params: QueryParams<TestModel> = QueryParams {
-            filters: vec![filter1, filter2],
-            ..Default::default()
-        };
+        let params = make_params_with_filters(vec![filter1, filter2]);
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
@@ -1288,9 +1369,9 @@ mod tests {
         );
         // Second condition should use $1 (not $2) since boolean didn't consume a slot
         assert!(
-            result.conditions[1].contains("$1"),
+            result.conditions[0].contains("$1"),
             "Second condition should use $1 since boolean didn't consume argument slot, got: {}",
-            result.conditions[1]
+            result.conditions[0]
         );
         // Only one argument should be in the arguments list
         assert_eq!(
@@ -1318,10 +1399,7 @@ mod tests {
             operator: FilterOperator::Eq,
             value: FilterValue::String("test".to_string()),
         };
-        let params: QueryParams<TestModel> = QueryParams {
-            filters: vec![filter1, filter2, filter3],
-            ..Default::default()
-        };
+        let params = make_params_with_filters(vec![filter1, filter2, filter3]);
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
@@ -1330,11 +1408,11 @@ mod tests {
         // Two boolean filters should not add arguments
         // String filter should use $1
         assert!(result.conditions[0].contains("IS TRUE"));
-        assert!(result.conditions[1].contains("IS NOT FALSE"));
+        assert!(result.conditions[0].contains("IS NOT FALSE"));
         assert!(
-            result.conditions[2].contains("$1"),
+            result.conditions[0].contains("$1"),
             "String filter should use $1, got: {}",
-            result.conditions[2]
+            result.conditions[0]
         );
         assert_eq!(
             result.arguments.len(),
@@ -1491,10 +1569,7 @@ mod tests {
             operator: FilterOperator::Between,
             value: FilterValue::Array(vec![FilterValue::Float(10.0), FilterValue::Float(100.0)]),
         };
-        let params: QueryParams<TestModelWithOptions> = QueryParams {
-            filters: vec![filter],
-            ..Default::default()
-        };
+        let params = make_option_params_with_filter(filter);
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
@@ -1885,10 +1960,7 @@ mod tests {
             operator: FilterOperator::Eq,
             value: FilterValue::Int(42),
         };
-        let params: QueryParams<TestModelWithOptions> = QueryParams {
-            filters: vec![filter],
-            ..Default::default()
-        };
+        let params = make_option_params_with_filter(filter);
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_virtual_column("computed_field", |_vc| "some_expression")
@@ -1916,10 +1988,7 @@ mod tests {
             operator: FilterOperator::Eq,
             value: FilterValue::Int(20251222),
         };
-        let params: QueryParams<TestModelWithOptions> = QueryParams {
-            filters: vec![filter1, filter2],
-            ..Default::default()
-        };
+        let params = make_option_params_with_filters(vec![filter1, filter2]);
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_column_cast("optional_amount", FieldType::Float)
@@ -1935,9 +2004,9 @@ mod tests {
         );
         // Second filter should have no cast (String)
         assert!(
-            !result.conditions[1].contains("::bigint"),
+            !result.conditions[0].contains("$2::bigint"),
             "optional_date should not have ::bigint, got: {}",
-            result.conditions[1]
+            result.conditions[0]
         );
     }
 
@@ -1954,10 +2023,7 @@ mod tests {
             operator: FilterOperator::Eq,
             value: FilterValue::String("test".to_string()),
         };
-        let params: QueryParams<TestModel> = QueryParams {
-            filters: vec![filter1, filter2],
-            ..Default::default()
-        };
+        let params = make_params_with_filters(vec![filter1, filter2]);
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_column_cast("name", FieldType::Uuid) // Override name to Uuid
@@ -1972,9 +2038,9 @@ mod tests {
         );
         // name should now have ::uuid (from override)
         assert!(
-            result.conditions[1].contains("::uuid"),
+            result.conditions[0].contains("::uuid"),
             "name should have ::uuid from override, got: {}",
-            result.conditions[1]
+            result.conditions[0]
         );
     }
 
@@ -1998,7 +2064,10 @@ mod tests {
             "virtual sort must emit the expression, not the aliased column"
         );
         assert!(
-            result.joins.iter().any(|j| j.contains("bill_activities ba")),
+            result
+                .joins
+                .iter()
+                .any(|j| j.contains("bill_activities ba")),
             "virtual sort must activate the registered join, got joins: {:?}",
             result.joins
         );
@@ -2040,7 +2109,10 @@ mod tests {
             "URL-driven sort must resolve virtual column expression"
         );
         assert!(
-            result.joins.iter().any(|j| j.contains("bill_activities ba")),
+            result
+                .joins
+                .iter()
+                .any(|j| j.contains("bill_activities ba")),
             "URL-driven sort must activate the registered join"
         );
     }

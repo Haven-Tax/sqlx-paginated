@@ -133,6 +133,16 @@ GET /users?page=1&page_size=25
 
 All non-reserved query parameters are treated as filters. Unknown extra parameters must still use `Operator:value` format or deserialization returns `FilterParseError::InvalidFilterFormat`.
 
+Logical groups use `$and` and `$or` with bracket notation.
+
+```text
+GET /users?$and[0][$or][0][username][Eq]=phiberber
+    &$and[0][$or][1][age][Gte]=18
+    &$and[1][organizationId]=550e8400-e29b-41d4-a716-446655440000
+```
+
+This becomes one root `AND` filter expression. Plain field values inside logical groups default to `Eq`.
+
 Supported filter operators:
 
 | Operator | SQL shape |

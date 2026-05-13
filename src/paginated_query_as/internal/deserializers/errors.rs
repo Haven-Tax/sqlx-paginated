@@ -17,6 +17,9 @@ pub enum FilterParseError {
 
     /// Only one of page/page_size provided (must be both or neither)
     IncompletePagination { provided: String },
+
+    /// Invalid logical filter syntax (e.g., malformed $and/$or query params)
+    InvalidLogicalFilter { path: String, reason: String },
 }
 
 impl std::error::Error for FilterParseError {}
@@ -53,6 +56,9 @@ impl fmt::Display for FilterParseError {
                     "incomplete pagination: '{}' provided without its counterpart",
                     provided
                 )
+            }
+            Self::InvalidLogicalFilter { path, reason } => {
+                write!(f, "invalid logical filter '{}': {}", path, reason)
             }
         }
     }
