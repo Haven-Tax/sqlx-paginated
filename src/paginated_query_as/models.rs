@@ -3,6 +3,7 @@ use crate::paginated_query_as::internal::{
     FilterParseError, QueryPaginationParams, QuerySearchParams, QuerySortParams,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
@@ -278,6 +279,44 @@ impl FilterExpressionGroup {
             }
         }
     }
+
+    pub fn partition_field(self, field: &str) -> (Vec<Filter>, Self) {
+        let mut extracted = Vec::new();
+        let children = partition_field_children(self.children, field, &mut extracted);
+        (
+            extracted,
+            Self {
+                operator: self.operator,
+                children,
+            },
+        )
+    }
+}
+
+fn partition_field_children(
+    children: Vec<FilterExpression>,
+    field: &str,
+    extracted: &mut Vec<Filter>,
+) -> Vec<FilterExpression> {
+    let mut kept = Vec::new();
+    for child in children {
+        match child {
+            FilterExpression::Condition(filter) if filter.field == field => extracted.push(filter),
+            FilterExpression::Condition(filter) => {
+                kept.push(FilterExpression::Condition(filter));
+            }
+            FilterExpression::Group(group) => {
+                let nested = partition_field_children(group.children, field, extracted);
+                if !nested.is_empty() {
+                    kept.push(FilterExpression::Group(FilterExpressionGroup {
+                        operator: group.operator,
+                        children: nested,
+                    }));
+                }
+            }
+        }
+    }
+    kept
 }
 
 impl Default for FilterExpressionGroup {
@@ -294,7 +333,7 @@ pub struct QueryParams<'q, T> {
     pub pagination: Option<QueryPaginationParams>,
     pub sort: Option<QuerySortParams>,
     pub search: QuerySearchParams,
-    pub filter_expression: FilterExpressionGroup,
+    pub filters: FilterExpressionGroup,
     pub(crate) _phantom: PhantomData<&'q T>,
 }
 
@@ -304,7 +343,7 @@ impl<'q, T> Default for QueryParams<'q, T> {
             pagination: None,
             sort: None,
             search: QuerySearchParams::default(),
-            filter_expression: FilterExpressionGroup::default(),
+            filters: FilterExpressionGroup::default(),
             _phantom: PhantomData,
         }
     }
@@ -333,7 +372,7 @@ impl<'q, T> TryFrom<FlatQueryParams> for QueryParams<'q, T> {
             pagination,
             sort: params.sort,
             search: params.search.unwrap_or_default(),
-            filter_expression: params.filters.unwrap_or_default(),
+            filters: params.filters.unwrap_or_default(),
             _phantom: PhantomData,
         })
     }
@@ -378,6 +417,63 @@ impl SortItem {
 pub struct SortEntry {
     pub item: SortItem,
     pub direction: QuerySortDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryBuildError {
+    pub message: String,
+}
+
+impl QueryBuildError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for QueryBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for QueryBuildError {}
+
+#[derive(Debug)]
+pub enum PaginatedQueryError {
+    QueryBuild(QueryBuildError),
+    Sqlx(sqlx::Error),
+}
+
+impl fmt::Display for PaginatedQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PaginatedQueryError::QueryBuild(e) => write!(f, "{e}"),
+            PaginatedQueryError::Sqlx(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PaginatedQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PaginatedQueryError::QueryBuild(e) => Some(e),
+            PaginatedQueryError::Sqlx(e) => Some(e),
+        }
+    }
+}
+
+impl From<QueryBuildError> for PaginatedQueryError {
+    fn from(value: QueryBuildError) -> Self {
+        Self::QueryBuild(value)
+    }
+}
+
+impl From<sqlx::Error> for PaginatedQueryError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Sqlx(value)
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +563,55 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_field_extracts_and_prunes() {
+        let group = FilterExpressionGroup::and(vec![
+            FilterExpression::Condition(Filter {
+                field: "status".to_string(),
+                operator: FilterOperator::Eq,
+                value: FilterValue::String("Pending".to_string()),
+            }),
+            FilterExpression::Condition(Filter {
+                field: "reviewable_by".to_string(),
+                operator: FilterOperator::Eq,
+                value: FilterValue::Uuid(uuid::Uuid::nil()),
+            }),
+            FilterExpression::Group(FilterExpressionGroup::or(vec![
+                FilterExpression::Condition(Filter {
+                    field: "reviewable_by".to_string(),
+                    operator: FilterOperator::Eq,
+                    value: FilterValue::Uuid(uuid::Uuid::nil()),
+                }),
+                FilterExpression::Condition(Filter {
+                    field: "created_by".to_string(),
+                    operator: FilterOperator::Eq,
+                    value: FilterValue::Uuid(uuid::Uuid::nil()),
+                }),
+            ])),
+        ]);
+
+        let (extracted, remaining) = group.partition_field("reviewable_by");
+
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted.iter().all(|f| f.field == "reviewable_by"));
+        assert_eq!(remaining.children.len(), 2);
+        assert_eq!(
+            remaining.children[0],
+            FilterExpression::Condition(Filter {
+                field: "status".to_string(),
+                operator: FilterOperator::Eq,
+                value: FilterValue::String("Pending".to_string()),
+            })
+        );
+        match &remaining.children[1] {
+            FilterExpression::Group(g) => {
+                assert_eq!(g.operator, LogicalOperator::Or);
+                assert_eq!(g.children.len(), 1);
+            }
+            _ => panic!("expected nested or group"),
+        }
+    }
+
+        #[test]
     fn test_sort_item_expression_to_sql_preserves_expression() {
         assert_eq!(
             SortItem::expression("LOWER(name)").to_sql("ignored"),

@@ -4,12 +4,13 @@ use crate::paginated_query_as::internal::{
 };
 use crate::paginated_query_as::models::{
     Filter, FilterExpression, FilterExpressionGroup, FilterOperator, FilterValue, LogicalOperator,
-    QueryParams, QuerySortDirection, SortEntry, SortItem,
+    QueryBuildError, QueryParams, QuerySortDirection, SortEntry, SortItem,
 };
 use serde::Serialize;
 use sqlx::{Arguments, Database, Encode, Type};
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Configuration for outer query wrapping.
 ///
@@ -140,6 +141,10 @@ pub struct QueryBuilder<'q, T, DB: Database> {
     pub(crate) sort_entries: Vec<SortEntry>,
     /// Outer query configuration (for window function filtering and aggregations)
     pub(crate) outer_query: Option<OuterQuery>,
+    pub(crate) reject_unknown_columns: bool,
+    pub(crate) pending_build_error: Option<QueryBuildError>,
+    pub(crate) filter_mappers:
+        HashMap<String, Arc<dyn Fn(&Filter, &mut DB::Arguments<'q>, &dyn QueryDialect) -> Option<String>>>,
 }
 
 impl<'q, T, DB> QueryBuilder<'q, T, DB>
@@ -164,8 +169,7 @@ where
     }
 
     fn is_column_safe(&self, column: &str) -> bool {
-        // Virtual columns bypass validation (developer-trusted)
-        if self.virtual_columns.contains_key(column) {
+        if self.virtual_columns.contains_key(column) || self.filter_mappers.contains_key(column) {
             return true;
         }
 
@@ -183,6 +187,54 @@ where
             Some(protection) => column_exists && protection.is_safe(column),
             None => column_exists,
         }
+    }
+
+    fn validate_filter_tree(&self, group: &FilterExpressionGroup) -> Result<(), QueryBuildError> {
+        for child in &group.children {
+            match child {
+                FilterExpression::Condition(filter) => {
+                    if !self.is_column_safe(&filter.field) {
+                        return Err(QueryBuildError::new(format!(
+                            "unknown or disallowed filter column: {}",
+                            filter.field
+                        )));
+                    }
+                }
+                FilterExpression::Group(nested) => {
+                    self.validate_filter_tree(nested)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_search_columns_allowed(
+        &self,
+        columns: &[String],
+    ) -> Result<(), QueryBuildError> {
+        for column in columns {
+            let mapper_exists = self.mappers.contains_key(column);
+            if !mapper_exists && !self.is_column_safe(column) {
+                return Err(QueryBuildError::new(format!(
+                    "unknown or disallowed search column: {}",
+                    column
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_sort_column_allowed(&self, column: &str) -> Result<(), QueryBuildError> {
+        if column.contains('.') {
+            return Ok(());
+        }
+        if self.is_column_safe(column) {
+            return Ok(());
+        }
+        Err(QueryBuildError::new(format!(
+            "unknown or disallowed sort column: {}",
+            column
+        )))
     }
 
     /// Activates joins for a virtual column (adds to active_joins if not already present).
@@ -324,17 +376,18 @@ where
     ///     })
     ///     .build();
     /// ```
-    pub fn with_virtual_column<F>(mut self, name: impl Into<String>, f: F) -> Self
+    pub fn with_virtual_column<F, S>(mut self, name: impl Into<String>, f: F) -> Self
     where
-        F: FnOnce(&mut VirtualColumnBuilder) -> &str,
+        F: FnOnce(&mut VirtualColumnBuilder) -> S,
+        S: Into<String>,
     {
         let mut builder = VirtualColumnBuilder::new();
-        let expression = f(&mut builder);
+        let expression = f(&mut builder).into();
 
         self.virtual_columns.insert(
             name.into(),
             VirtualColumn {
-                expression: expression.to_string(),
+                expression,
                 joins: builder.joins,
                 column_type: builder.column_type,
             },
@@ -367,6 +420,18 @@ where
         F: Fn(&str, &str) -> (String, Option<String>) + 'static,
     {
         self.mappers.insert(column.to_string(), Box::new(mapper));
+        self
+    }
+
+    pub fn map_filter<F>(mut self, field: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&Filter, &mut DB::Arguments<'q>, &dyn QueryDialect) -> Option<String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.filter_mappers
+            .insert(field.into(), Arc::new(handler));
         self
     }
 
@@ -407,9 +472,18 @@ where
     ///     .build();
     /// ```
     pub fn with_search(mut self, params: &QueryParams<T>) -> Self {
+        if self.pending_build_error.is_some() {
+            return self;
+        }
         if let Some(search) = &params.search.search {
             if let Some(columns) = &params.search.search_columns {
                 if !columns.is_empty() && !search.trim().is_empty() {
+                    if self.reject_unknown_columns {
+                        if let Err(e) = self.validate_search_columns_allowed(columns) {
+                            self.pending_build_error = Some(e);
+                            return self;
+                        }
+                    }
                     let pattern = format!("%{}%", search);
                     let next_argument = self.arguments.len() + 1;
 
@@ -494,7 +568,7 @@ where
     ///
     /// - Supports multiple operators: Eq, Ne, Gt, Lt, Gte, Lte, Like, ILike, In, NotIn, IsNull, IsNotNull, Between, Contains
     /// - Only applies filters for columns that exist and are considered safe
-    /// - Skips invalid columns with a warning when tracing is enabled
+    /// - When strict column checks are enabled (default), unknown filter columns fail at build time instead of being skipped
     ///
     /// # Returns
     ///
@@ -521,7 +595,16 @@ where
     ///     .build();
     /// ```
     pub fn with_filters(mut self, params: &QueryParams<T>) -> Self {
-        if let Some(condition) = self.build_filter_group_condition(&params.filter_expression) {
+        if self.pending_build_error.is_some() {
+            return self;
+        }
+        if self.reject_unknown_columns {
+            if let Err(e) = self.validate_filter_tree(&params.filters) {
+                self.pending_build_error = Some(e);
+                return self;
+            }
+        }
+        if let Some(condition) = self.build_filter_group_condition(&params.filters) {
             self.conditions.push(condition);
         }
         self
@@ -559,6 +642,10 @@ where
     fn build_filter_condition(&mut self, filter: &Filter) -> Option<String> {
         let field = &filter.field;
 
+        if let Some(handler) = self.filter_mappers.get(field).cloned() {
+            return handler(filter, &mut self.arguments, &*self.dialect);
+        }
+
         // Check for virtual column first
         let (table_column, field_type) = if let Some(vc) = self.virtual_columns.get(field).cloned()
         {
@@ -567,7 +654,9 @@ where
         } else {
             if !self.is_column_safe(field) {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
+                if !self.reject_unknown_columns {
+                    tracing::warn!(column = %field, valid_columns = %self.valid_columns.join(", "), "Skipping invalid filter column");
+                }
                 return None;
             }
             (
@@ -773,6 +862,16 @@ where
         condition: impl Into<String>,
         value: String,
     ) -> Self {
+        if self.pending_build_error.is_some() {
+            return self;
+        }
+        if self.reject_unknown_columns && !self.is_column_safe(column) {
+            self.pending_build_error = Some(QueryBuildError::new(format!(
+                "unknown or disallowed condition column: {}",
+                column
+            )));
+            return self;
+        }
         if self.is_column_safe(column) {
             let next_argument = self.arguments.len() + 1;
             self.conditions.push(format!(
@@ -907,6 +1006,11 @@ where
         self
     }
 
+    pub fn allow_unknown_columns(mut self) -> Self {
+        self.reject_unknown_columns = false;
+        self
+    }
+
     pub fn enable_column_validation(mut self) -> Self {
         self.column_validation_enabled = true;
         self
@@ -1025,12 +1129,23 @@ where
     ///
     /// If `params.sort` names a registered virtual column, its expression is used and any
     /// associated joins are activated — mirroring the behavior of `with_filters` and `with_search`.
-    pub fn with_sorting(self, params: &QueryParams<T>) -> Self {
+    pub fn with_sorting(mut self, params: &QueryParams<T>) -> Self {
+        if self.pending_build_error.is_some() {
+            return self;
+        }
         let Some(sort) = params.sort.as_ref() else {
             return self;
         };
         match (sort.sort_column.as_deref(), sort.sort_direction.as_ref()) {
-            (Some(column), Some(direction)) => self.with_sort_column(column, direction.clone()),
+            (Some(column), Some(direction)) => {
+                if self.reject_unknown_columns {
+                    if let Err(e) = self.validate_sort_column_allowed(column) {
+                        self.pending_build_error = Some(e);
+                        return self;
+                    }
+                }
+                self.with_sort_column(column, direction.clone())
+            }
             _ => self,
         }
     }
@@ -1070,8 +1185,11 @@ where
         self
     }
 
-    pub fn build(self) -> QueryBuildResult<'q, DB> {
-        QueryBuildResult {
+    pub fn build(self) -> Result<QueryBuildResult<'q, DB>, QueryBuildError> {
+        if let Some(e) = self.pending_build_error {
+            return Err(e);
+        }
+        Ok(QueryBuildResult {
             conditions: self.conditions,
             arguments: self.arguments,
             joins: self.active_joins,
@@ -1081,7 +1199,7 @@ where
             distinct_on_columns: self.distinct_on_columns,
             sort_entries: self.sort_entries,
             outer_query: self.outer_query,
-        }
+        })
     }
 }
 
@@ -1121,7 +1239,7 @@ mod tests {
 
     fn make_params_with_filters(filters: Vec<Filter>) -> QueryParams<'static, TestModel> {
         QueryParams {
-            filter_expression: FilterExpressionGroup::and(
+            filters: FilterExpressionGroup::and(
                 filters
                     .into_iter()
                     .map(FilterExpression::Condition)
@@ -1141,7 +1259,7 @@ mod tests {
         filters: Vec<Filter>,
     ) -> QueryParams<'static, TestModelWithOptions> {
         QueryParams {
-            filter_expression: FilterExpressionGroup::and(
+            filters: FilterExpressionGroup::and(
                 filters
                     .into_iter()
                     .map(FilterExpression::Condition)
@@ -1158,7 +1276,7 @@ mod tests {
     #[test]
     fn test_logical_or_filter_group_generates_grouped_condition() {
         let params = QueryParams::<TestModel> {
-            filter_expression: FilterExpressionGroup::and(vec![FilterExpression::Group(
+            filters: FilterExpressionGroup::and(vec![FilterExpression::Group(
                 FilterExpressionGroup::or(vec![
                     FilterExpression::Condition(Filter {
                         field: "name".to_string(),
@@ -1177,13 +1295,28 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert_eq!(result.conditions.len(), 1);
         assert!(result.conditions[0].contains(" OR "));
         assert!(result.conditions[0].contains("$1"));
         assert!(result.conditions[0].contains("$2::bigint"));
         assert_eq!(result.arguments.len(), 2);
+    }
+
+    #[test]
+    fn test_unknown_filter_column_returns_query_build_error() {
+        let filter = Filter {
+            field: "nonexistent_column".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(1),
+        };
+        let params = make_params_with_filter(filter);
+        let err = QueryBuilder::<TestModel, Postgres>::new()
+            .with_filters(&params)
+            .build()
+            .expect_err("expected query build error");
+        assert!(err.message.contains("nonexistent_column"));
     }
 
     #[test]
@@ -1197,7 +1330,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert_eq!(result.conditions.len(), 1);
         assert!(
@@ -1218,7 +1351,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::bigint"),
@@ -1239,7 +1372,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::float8"),
@@ -1259,7 +1392,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Boolean Eq uses IS TRUE/FALSE syntax for proper NULL handling
         assert!(
@@ -1286,7 +1419,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("IS FALSE"),
@@ -1306,7 +1439,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("IS NOT TRUE"),
@@ -1332,7 +1465,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("IS NOT FALSE"),
@@ -1359,7 +1492,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // First condition should be IS TRUE (no placeholder)
         assert!(
@@ -1403,7 +1536,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Two boolean filters should not add arguments
         // String filter should use $1
@@ -1434,7 +1567,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::uuid"),
@@ -1454,7 +1587,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // String values should not have type cast
         assert!(
@@ -1480,7 +1613,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::timestamptz"),
@@ -1501,7 +1634,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date"),
@@ -1522,7 +1655,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::time"),
@@ -1550,7 +1683,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Each value in IN clause should have ::bigint cast
         let condition = &result.conditions[0];
@@ -1573,7 +1706,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         let condition = &result.conditions[0];
         let float8_count = condition.matches("::float8").count();
@@ -1599,7 +1732,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // When using LIKE on non-string field, column should be cast to text
         assert!(
@@ -1620,7 +1753,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // String field should not have column cast, just LIKE
         assert!(
@@ -1646,7 +1779,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::text ILIKE"),
@@ -1672,7 +1805,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Column should be cast to ::date for proper date comparison
         assert!(
@@ -1693,7 +1826,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date <>"),
@@ -1713,7 +1846,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date >"),
@@ -1733,7 +1866,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date <"),
@@ -1753,7 +1886,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date >="),
@@ -1773,7 +1906,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date <="),
@@ -1796,7 +1929,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Column should be cast to ::date
         assert!(
@@ -1820,7 +1953,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date NOT IN"),
@@ -1843,7 +1976,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::date BETWEEN"),
@@ -1864,7 +1997,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Should have ::timestamptz for the value, but column should NOT be cast
         assert!(
@@ -1892,7 +2025,7 @@ mod tests {
 
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             !result.conditions[0].contains("::date"),
@@ -1919,7 +2052,7 @@ mod tests {
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_column_cast("optional_amount", FieldType::String)
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // String type has no cast, so ::bigint should NOT be present
         assert!(
@@ -1942,7 +2075,7 @@ mod tests {
         let result = QueryBuilder::<TestModelWithOptions, Postgres>::new()
             .with_column_cast("optional_amount", FieldType::Float)
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         assert!(
             result.conditions[0].contains("::float8"),
@@ -1966,7 +2099,7 @@ mod tests {
             .with_virtual_column("computed_field", |_vc| "some_expression")
             .with_column_cast("computed_field", FieldType::Int)
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // Should have ::bigint from the override, not default String (no cast)
         assert!(
@@ -1994,7 +2127,7 @@ mod tests {
             .with_column_cast("optional_amount", FieldType::Float)
             .with_column_cast("optional_date", FieldType::String)
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // First filter should have ::float8
         assert!(
@@ -2028,7 +2161,7 @@ mod tests {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_column_cast("name", FieldType::Uuid) // Override name to Uuid
             .with_filters(&params)
-            .build();
+            .build().unwrap();
 
         // id should still have ::bigint (from struct inference)
         assert!(
@@ -2056,7 +2189,7 @@ mod tests {
                 "ba.created_at"
             })
             .with_sort_column("payment_date", QuerySortDirection::Descending)
-            .build();
+            .build().unwrap();
 
         let order_sql = result.sort_entries[0].item.to_sql("base_query");
         assert_eq!(
@@ -2077,7 +2210,7 @@ mod tests {
     fn test_with_sort_column_non_virtual_falls_through_to_column() {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_sort_column("name", QuerySortDirection::Ascending)
-            .build();
+            .build().unwrap();
 
         let order_sql = result.sort_entries[0].item.to_sql("base_query");
         assert_eq!(order_sql, "\"base_query\".\"name\"");
@@ -2100,7 +2233,7 @@ mod tests {
                 "ba.created_at"
             })
             .with_sorting(&params)
-            .build();
+            .build().unwrap();
 
         assert_eq!(result.sort_entries.len(), 1);
         assert_eq!(
@@ -2122,11 +2255,42 @@ mod tests {
         let params: QueryParams<TestModel> = QueryParams::default();
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_sorting(&params)
-            .build();
+            .build().unwrap();
         assert!(result.sort_entries.is_empty());
     }
 
     #[test]
+    fn test_map_filter_compiles_predicate_with_bind() {
+        let member_id = uuid::Uuid::nil();
+        let params = QueryParams {
+            filters: FilterExpressionGroup::and(vec![FilterExpression::Condition(
+                Filter {
+                    field: "reviewable_by".to_string(),
+                    operator: FilterOperator::Eq,
+                    value: FilterValue::Uuid(member_id),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .map_filter("reviewable_by", |filter, args, dialect| {
+                let FilterValue::Uuid(id) = &filter.value else {
+                    return None;
+                };
+                let placeholder = dialect.placeholder(args.len() + 1);
+                args.add(id.to_string()).ok()?;
+                Some(format!("EXISTS (SELECT 1 WHERE member_id = {placeholder})"))
+            })
+            .with_filters(&params)
+            .build()
+            .unwrap();
+
+        assert_eq!(result.conditions.len(), 1);
+        assert!(result.conditions[0].contains("EXISTS (SELECT 1 WHERE member_id = $1)"));
+    }
+
+        #[test]
     fn test_with_sorting_missing_direction_is_noop() {
         let params: QueryParams<TestModel> = QueryParams {
             sort: Some(QuerySortParams {
@@ -2137,7 +2301,7 @@ mod tests {
         };
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_sorting(&params)
-            .build();
+            .build().unwrap();
         assert!(result.sort_entries.is_empty());
     }
 }

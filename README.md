@@ -136,12 +136,12 @@ All non-reserved query parameters are treated as filters. Unknown extra paramete
 Logical groups use `$and` and `$or` with bracket notation.
 
 ```text
-GET /users?$and[0][$or][0][username][Eq]=phiberber
-    &$and[0][$or][1][age][Gte]=18
-    &$and[1][organizationId]=550e8400-e29b-41d4-a716-446655440000
+GET /users?$and[0][$or][0][username]=Eq:phiberber
+    &$and[0][$or][1][age]=Gte:18
+    &$and[1][organizationId]=Eq:550e8400-e29b-41d4-a716-446655440000
 ```
 
-This becomes one root `AND` filter expression. Plain field values inside logical groups default to `Eq`.
+This becomes one root `AND` filter expression. Bracket leaf values encode operator in value.
 
 Supported filter operators:
 
@@ -152,7 +152,7 @@ Supported filter operators:
 | `Like`, `ILike` | pattern match; non-strings cast to text |
 | `In`, `NotIn` | comma-separated values |
 | `Between` | two comma-separated values |
-| `IsNull`, `IsNotNull` | null checks; value ignored |
+| `IsNull`, `IsNotNull` | null checks; bracket form uses bare operator value |
 | `Contains` | PostgreSQL `@>` |
 
 Filter values are parsed in this order: bool, UUID, RFC3339 datetime, naive datetime, date, time, integer, float, string. Date filters cast timestamp columns to `::date` so calendar-day comparisons work as expected.

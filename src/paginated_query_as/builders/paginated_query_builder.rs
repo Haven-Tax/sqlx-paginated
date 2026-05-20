@@ -1,14 +1,17 @@
 use crate::paginated_query_as::builders::QueryBuildResult;
 use crate::paginated_query_as::examples::postgres_examples::build_query_with_safe_defaults;
 use crate::paginated_query_as::internal::quote_identifier;
-use crate::paginated_query_as::models::{QuerySortDirection, SortEntry};
+use crate::paginated_query_as::models::{PaginatedQueryError, QueryBuildError, QuerySortDirection, SortEntry};
 use crate::{PaginatedResponse, QueryParams};
 use serde::Serialize;
 use sqlx::{postgres::Postgres, query::QueryAs, Execute, FromRow, IntoArguments, Pool};
 use std::sync::Arc;
 
-type BuildQueryFn<T> =
-    Arc<dyn for<'a> Fn(&QueryParams<'a, T>) -> QueryBuildResult<'static, Postgres> + Send + Sync>;
+type BuildQueryFn<T> = Arc<
+    dyn for<'a> Fn(&QueryParams<'a, T>) -> Result<QueryBuildResult<'static, Postgres>, QueryBuildError>
+        + Send
+        + Sync,
+>;
 
 pub struct PaginatedQueryBuilder<'q, T, A>
 where
@@ -84,7 +87,7 @@ where
 
     pub fn with_query_builder<F>(self, build_query_fn: F) -> Self
     where
-        F: for<'a> Fn(&QueryParams<'a, T>) -> QueryBuildResult<'static, Postgres>
+        F: for<'a> Fn(&QueryParams<'a, T>) -> Result<QueryBuildResult<'static, Postgres>, QueryBuildError>
             + Send
             + Sync
             + 'static,
@@ -129,14 +132,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns `sqlx::Error` if the query execution fails
+    /// Returns `PaginatedQueryError::QueryBuild` when the query builder rejects parameters (for example unknown filter columns).
+    /// Returns `PaginatedQueryError::Sqlx` when the database query fails.
     pub async fn fetch_paginated(
         self,
         pool: &Pool<Postgres>,
-    ) -> Result<PaginatedResponse<T>, sqlx::Error> {
+    ) -> Result<PaginatedResponse<T>, PaginatedQueryError> {
         let base_sql = self.build_base_query();
         let build_query_fn = &self.build_query_fn;
-        let main_result = build_query_fn(&self.params);
+        let main_result = build_query_fn(&self.params)?;
         let join_clause = self.build_join_clause(&main_result.joins);
         let where_clause = self.build_where_clause(&main_result.conditions);
         let group_by_clause =
@@ -179,7 +183,7 @@ where
             Some(_) | None => String::new(),
         };
         let (total, total_pages, pagination) = if self.totals_count_enabled {
-            let count_result = build_query_fn(&self.params);
+            let count_result = build_query_fn(&self.params)?;
             let count_sql = build_count_sql(CountSqlInputs {
                 base_sql: &base_sql,
                 select_target: &select_target,
@@ -476,14 +480,15 @@ mod tests {
     fn test_table_alias_in_select_clause() {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_table_alias("base_query")
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(result.table_alias, "base_query");
     }
 
     #[test]
     fn test_default_table_alias() {
-        let result = QueryBuilder::<TestModel, Postgres>::new().build();
+        let result = QueryBuilder::<TestModel, Postgres>::new().build().unwrap();
 
         assert_eq!(result.table_alias, "base_query");
     }
@@ -492,7 +497,8 @@ mod tests {
     fn test_custom_table_alias() {
         let result = QueryBuilder::<TestModel, Postgres>::new()
             .with_table_alias("custom_cte")
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(result.table_alias, "custom_cte");
     }

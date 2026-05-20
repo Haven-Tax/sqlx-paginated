@@ -1,10 +1,11 @@
-use super::FilterParseError;
-use crate::paginated_query_as::models::{
-    Filter, FilterExpression, FilterExpressionGroup, FilterOperator, FilterValue, LogicalOperator,
+use super::filter_bracket::{
+    bracket_insert, bracket_tree_is_empty, bracket_tree_to_expression, is_logical_bracket_field,
+    new_bracket_tree, parse_bracket_path, parse_query_value,
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use super::filter_condition::{parse_condition, ConditionSyntax};
+use super::FilterParseError;
+use crate::paginated_query_as::models::{FilterExpression, FilterExpressionGroup};
 use serde::{de::Error, Deserialize, Deserializer};
-use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 const RESERVED_QUERY_PARAMS: &[&str] = &[
@@ -15,267 +16,6 @@ const RESERVED_QUERY_PARAMS: &[&str] = &[
     "search",
     "search_columns",
 ];
-
-/// Parses a string value into a FilterValue with automatic type inference.
-/// Type inference order: Bool -> Uuid -> DateTime -> Date -> Time -> Int -> Float -> String
-fn parse_filter_value(s: &str) -> FilterValue {
-    if s.is_empty() {
-        return FilterValue::Null;
-    }
-
-    // Try boolean
-    match s.to_lowercase().as_str() {
-        "true" => return FilterValue::Bool(true),
-        "false" => return FilterValue::Bool(false),
-        _ => {}
-    }
-
-    // Try UUID
-    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-        return FilterValue::Uuid(uuid);
-    }
-
-    // Try DateTime (RFC 3339 / ISO 8601 with timezone)
-    // Examples: 2025-12-02T10:30:00Z, 2025-12-02T10:30:00+00:00
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
-        return FilterValue::DateTime(dt.to_utc().to_string());
-    }
-
-    // Try NaiveDateTime (ISO 8601 without timezone)
-    // Examples: 2025-12-02T10:30:00, 2025-12-02 10:30:00
-    if NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
-        || NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").is_ok()
-        || NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
-    {
-        return FilterValue::DateTime(s.to_string());
-    }
-
-    // Try Date (YYYY-MM-DD)
-    if NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
-        return FilterValue::Date(s.to_string());
-    }
-
-    // Try Time (HH:MM:SS)
-    if NaiveTime::parse_from_str(s, "%H:%M:%S").is_ok()
-        || NaiveTime::parse_from_str(s, "%H:%M").is_ok()
-    {
-        return FilterValue::Time(s.to_string());
-    }
-
-    // Try integer
-    if let Ok(i) = s.parse::<i64>() {
-        return FilterValue::Int(i);
-    }
-
-    // Try float
-    if let Ok(f) = s.parse::<f64>() {
-        return FilterValue::Float(f);
-    }
-
-    // Fallback to string
-    FilterValue::String(s.to_string())
-}
-
-/// Parses comma-separated values into a Vec<FilterValue>.
-fn parse_array_values(s: &str) -> Vec<FilterValue> {
-    s.split(',').map(|v| parse_filter_value(v.trim())).collect()
-}
-
-fn filter_value_from_json(value: &Value) -> FilterValue {
-    match value {
-        Value::Null => FilterValue::Null,
-        Value::Bool(value) => FilterValue::Bool(*value),
-        Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                FilterValue::Int(value)
-            } else if let Some(value) = value.as_f64() {
-                FilterValue::Float(value)
-            } else {
-                FilterValue::String(value.to_string())
-            }
-        }
-        Value::String(value) => parse_filter_value(value),
-        Value::Array(values) => {
-            FilterValue::Array(values.iter().map(filter_value_from_json).collect())
-        }
-        Value::Object(_) => FilterValue::String(value.to_string()),
-    }
-}
-
-fn filter_value_for_operator(operator: FilterOperator, value: &Value) -> FilterValue {
-    match operator {
-        FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
-        FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
-            match filter_value_from_json(value) {
-                FilterValue::Array(values) => FilterValue::Array(values),
-                value => FilterValue::Array(vec![value]),
-            }
-        }
-        _ => filter_value_from_json(value),
-    }
-}
-
-fn parse_filter_from_raw(field: &str, raw_value: &str) -> Result<Filter, FilterParseError> {
-    let (operator_str, value_str) =
-        raw_value
-            .split_once(':')
-            .ok_or_else(|| FilterParseError::InvalidFilterFormat {
-                field: field.to_string(),
-                raw_value: raw_value.to_string(),
-            })?;
-
-    let operator = operator_str
-        .parse::<FilterOperator>()
-        .map_err(|raw_operator| FilterParseError::InvalidOperator {
-            field: field.to_string(),
-            raw_operator,
-        })?;
-
-    let value = match operator {
-        FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
-        FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
-            FilterValue::Array(parse_array_values(value_str))
-        }
-        _ => parse_filter_value(value_str),
-    };
-
-    Ok(Filter {
-        field: field.to_string(),
-        operator,
-        value,
-    })
-}
-
-fn filter_expression(field: &str, operator: FilterOperator, value: &Value) -> FilterExpression {
-    FilterExpression::Condition(Filter {
-        field: field.to_string(),
-        operator,
-        value: filter_value_for_operator(operator, value),
-    })
-}
-
-fn parse_field_expression(
-    field: &str,
-    value: &Value,
-) -> Result<Vec<FilterExpression>, FilterParseError> {
-    match value {
-        Value::Object(operators) if !operators.is_empty() => operators
-            .iter()
-            .map(|(operator, value)| {
-                operator
-                    .parse::<FilterOperator>()
-                    .map(|operator| filter_expression(field, operator, value))
-                    .map_err(|raw_operator| FilterParseError::InvalidOperator {
-                        field: field.to_string(),
-                        raw_operator,
-                    })
-            })
-            .collect(),
-        _ => Ok(vec![filter_expression(field, FilterOperator::Eq, value)]),
-    }
-}
-
-fn parse_logical_group(
-    operator: LogicalOperator,
-    value: &Value,
-) -> Result<FilterExpression, FilterParseError> {
-    let Value::Array(items) = value else {
-        return Err(FilterParseError::InvalidLogicalFilter {
-            path: operator.as_str().to_string(),
-            reason: "expected an array".to_string(),
-        });
-    };
-
-    let children = items
-        .iter()
-        .map(parse_expression_value)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(FilterExpression::Group(FilterExpressionGroup {
-        operator,
-        children,
-    }))
-}
-
-fn parse_expression_object(map: &Map<String, Value>) -> Result<FilterExpression, FilterParseError> {
-    let mut children = Vec::new();
-
-    for (field, value) in map {
-        if let Ok(operator) = field.parse::<LogicalOperator>() {
-            children.push(parse_logical_group(operator, value)?);
-        } else {
-            children.extend(parse_field_expression(field, value)?);
-        }
-    }
-
-    match children.len() {
-        0 => Ok(FilterExpression::Group(FilterExpressionGroup::default())),
-        1 => Ok(children.remove(0)),
-        _ => Ok(FilterExpression::Group(FilterExpressionGroup::and(
-            children,
-        ))),
-    }
-}
-
-fn parse_expression_value(value: &Value) -> Result<FilterExpression, FilterParseError> {
-    let Value::Object(map) = value else {
-        return Err(FilterParseError::InvalidLogicalFilter {
-            path: value.to_string(),
-            reason: "expected an object".to_string(),
-        });
-    };
-
-    parse_expression_object(map)
-}
-
-fn parse_bracket_path(field: &str) -> Option<Vec<&str>> {
-    let (root, _) = field.split_once('[')?;
-    root.parse::<LogicalOperator>().ok()?;
-
-    let mut tokens = vec![root];
-    let mut rest = &field[root.len()..];
-
-    while let Some(stripped) = rest.strip_prefix('[') {
-        let (token, next) = stripped.split_once(']')?;
-        if token.is_empty() {
-            return None;
-        }
-        tokens.push(token);
-        rest = next;
-    }
-
-    rest.is_empty().then_some(tokens)
-}
-
-fn insert_bracket_value(root: &mut Value, path: &[&str], value: Value) {
-    let Some((head, tail)) = path.split_first() else {
-        *root = value;
-        return;
-    };
-
-    if let Ok(index) = head.parse::<usize>() {
-        if !root.is_array() {
-            *root = Value::Array(Vec::new());
-        }
-        let items = root.as_array_mut().expect("root was just made an array");
-        items.resize(index + 1, Value::Null);
-        insert_bracket_value(&mut items[index], tail, value);
-    } else {
-        if !root.is_object() {
-            *root = Value::Object(Map::new());
-        }
-        let entry = root
-            .as_object_mut()
-            .expect("root was just made an object")
-            .entry((*head).to_string())
-            .or_insert(Value::Null);
-        insert_bracket_value(entry, tail, value);
-    }
-}
-
-fn parse_query_value(value: String) -> Value {
-    serde_json::from_str(&value).unwrap_or(Value::String(value))
-}
 
 /// Deserializes query parameters into a root AND filter expression group.
 ///
@@ -300,7 +40,7 @@ where
     };
 
     let mut children = Vec::new();
-    let mut bracket_filters = Value::Object(Map::new());
+    let mut bracket_filters = new_bracket_tree();
 
     for (field, raw_value) in map {
         if RESERVED_QUERY_PARAMS.contains(&field.as_str()) {
@@ -308,19 +48,33 @@ where
         }
 
         if let Some(path) = parse_bracket_path(&field) {
-            insert_bracket_value(&mut bracket_filters, &path, parse_query_value(raw_value));
+            bracket_insert(
+                &mut bracket_filters,
+                &path,
+                parse_query_value(raw_value),
+            )
+            .map_err(D::Error::custom)?;
             continue;
         }
 
-        let filter = parse_filter_from_raw(&field, &raw_value).map_err(D::Error::custom)?;
+        if is_logical_bracket_field(&field)
+            || (field.starts_with('[') && (field.contains("$and") || field.contains("$or")))
+        {
+            return Err(D::Error::custom(FilterParseError::InvalidLogicalFilter {
+                path: field,
+                reason: "malformed logical filter path".to_string(),
+            }));
+        }
+
+        let filter =
+            parse_condition(&field, &raw_value, ConditionSyntax::Flat).map_err(D::Error::custom)?;
         children.push(FilterExpression::Condition(filter));
     }
 
-    if bracket_filters
-        .as_object()
-        .is_some_and(|map| !map.is_empty())
-    {
-        children.push(parse_expression_value(&bracket_filters).map_err(D::Error::custom)?);
+    if !bracket_tree_is_empty(&bracket_filters) {
+        children.push(
+            bracket_tree_to_expression(bracket_filters).map_err(D::Error::custom)?,
+        );
     }
 
     if children.is_empty() {
@@ -332,7 +86,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::filter_value::{parse_array_values, parse_filter_value};
     use super::*;
+    use crate::paginated_query_as::models::{
+        FilterExpression, FilterOperator, FilterValue, LogicalOperator,
+    };
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -379,9 +137,35 @@ mod tests {
     #[test]
     fn test_bracket_logical_filters_deserialize() {
         let params: TestParams = serde_json::from_value(serde_json::json!({
-            "$and[0][$or][0][username][Eq]": "phiberber",
-            "$and[0][$or][1][age][Gte]": "18",
-            "$and[1][organizationId]": "550e8400-e29b-41d4-a716-446655440000"
+            "$and[0][$or][0][username]": "Eq:phiberber",
+            "$and[0][$or][1][age]": "Gte:18",
+            "$and[1][organizationId]": "Eq:550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        let conditions = root.collect_conditions();
+        assert_eq!(conditions.len(), 3);
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "username"
+                && filter.operator == FilterOperator::Eq
+                && filter.value == FilterValue::String("phiberber".to_string())
+        }));
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "age"
+                && filter.operator == FilterOperator::Gte
+                && filter.value == FilterValue::Int(18)
+        }));
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "organizationId" && filter.operator == FilterOperator::Eq
+        }));
+    }
+
+    #[test]
+    fn test_bracket_is_not_null_filter_deserialize() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "$and[0][deleted_at]": "IsNotNull"
         }))
         .unwrap();
 
@@ -392,8 +176,49 @@ mod tests {
         let FilterExpression::Group(and_group) = &root.children[0] else {
             panic!("expected nested AND group");
         };
-        assert_eq!(and_group.operator, LogicalOperator::And);
-        assert_eq!(and_group.children.len(), 2);
+        assert_eq!(and_group.children.len(), 1);
+
+        let FilterExpression::Condition(filter) = &and_group.children[0] else {
+            panic!("expected condition");
+        };
+        assert_eq!(filter.field, "deleted_at");
+        assert_eq!(filter.operator, FilterOperator::IsNotNull);
+        assert_eq!(filter.value, FilterValue::Null);
+    }
+
+    #[test]
+    fn test_old_bracket_operator_key_is_rejected() {
+        let params = serde_json::from_value::<TestParams>(serde_json::json!({
+            "$and[0][username][Eq]": "phiberber"
+        }));
+
+        assert!(params.is_err());
+    }
+
+    #[test]
+    fn test_malformed_logical_bracket_key_is_rejected() {
+        let params = serde_json::from_value::<TestParams>(serde_json::json!({
+            "$or[1][$or[0][status]]": "Eq:Scheduled"
+        }));
+
+        assert!(params.is_err());
+    }
+
+    #[test]
+    fn test_logical_bracket_key_with_opening_bracket_parses() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "[$or][0][status]": "Eq:Pending"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.children.len(), 1);
+        assert!(matches!(
+            &root.children[0],
+            FilterExpression::Group(group) if group.operator == LogicalOperator::Or
+        ));
+        assert_eq!(root.collect_conditions().len(), 1);
     }
 
     #[test]

@@ -28,7 +28,9 @@ where
     T: Default + Serialize,
 {
     let default_value = T::default();
-    let json_value = serde_json::to_value(default_value).unwrap();
+    let Ok(json_value) = serde_json::to_value(default_value) else {
+        return HashMap::new();
+    };
 
     let mut result = HashMap::new();
     if let Value::Object(map) = json_value {

@@ -3,17 +3,18 @@ mod paginated_query_as;
 pub use crate::paginated_query_as::{
     paginated_query_as, FieldType, Filter, FilterExpression, FilterExpressionGroup, FilterOperator,
     FilterParseError, FilterValue, FlatQueryParams, LogicalOperator, OuterQuery, OuterQueryBuilder,
-    PaginatedQueryBuilder, PaginatedResponse, QueryBuildResult, QueryBuilder, QueryParams,
-    QueryParamsBuilder, QuerySortDirection, SortEntry, SortItem, VirtualColumn,
-    VirtualColumnBuilder,
+    PaginatedQueryBuilder, PaginatedQueryError, PaginatedResponse, QueryBuildError, QueryBuildResult,
+    QueryBuilder, QueryParams, QueryParamsBuilder, QuerySortDirection, SortEntry, SortItem,
+    VirtualColumn, VirtualColumnBuilder,
 };
 
 pub mod prelude {
     pub use super::{
         paginated_query_as, FieldType, Filter, FilterExpression, FilterExpressionGroup,
         FilterOperator, FilterParseError, FilterValue, FlatQueryParams, LogicalOperator,
-        OuterQuery, OuterQueryBuilder, PaginatedQueryBuilder, PaginatedResponse, QueryBuildResult,
-        QueryBuilder, QueryParams, QueryParamsBuilder, QuerySortDirection, SortEntry, SortItem,
-        VirtualColumn, VirtualColumnBuilder,
+        OuterQuery, OuterQueryBuilder, PaginatedQueryBuilder, PaginatedQueryError, PaginatedResponse,
+        QueryBuildError,
+        QueryBuildResult, QueryBuilder, QueryParams, QueryParamsBuilder, QuerySortDirection,
+        SortEntry, SortItem, VirtualColumn, VirtualColumnBuilder,
     };
 }

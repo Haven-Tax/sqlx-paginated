@@ -42,6 +42,9 @@ where
             distinct_on_columns: None,
             sort_entries: Vec::new(),
             outer_query: None,
+            reject_unknown_columns: true,
+            pending_build_error: None,
+            filter_mappers: HashMap::new(),
         }
     }
 }

@@ -212,7 +212,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
         value: FilterValue,
     ) -> Self {
         self.query
-            .filter_expression
+            .filters
             .children
             .push(FilterExpression::Condition(Filter {
                 field: field.into(),
@@ -281,10 +281,14 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     /// ```
     pub fn with_filters(mut self, filters: Vec<Filter>) -> Self {
         self.query
-            .filter_expression
+            .filters
             .children
             .extend(filters.iter().cloned().map(FilterExpression::Condition));
         self
+    }
+
+    pub fn with_filter_group(self, group: FilterExpressionGroup) -> Self {
+        self.with_filter_expression(FilterExpression::Group(group))
     }
 
     /// Adds a grouped filter expression.
@@ -292,14 +296,14 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     /// The root query filter expression is always an AND group, so this expression
     /// is added as one child alongside any flat filters.
     pub fn with_filter_expression(mut self, expression: FilterExpression) -> Self {
-        self.query.filter_expression.children.push(expression);
+        self.query.filters.children.push(expression);
         self
     }
 
     /// Adds an AND group as a child of the root AND filter group.
     pub fn with_and_filters(mut self, children: Vec<FilterExpression>) -> Self {
         self.query
-            .filter_expression
+            .filters
             .children
             .push(FilterExpression::Group(FilterExpressionGroup::and(
                 children,
@@ -310,7 +314,7 @@ impl<'q, T: Default + Serialize> QueryParamsBuilder<'q, T> {
     /// Adds an OR group as a child of the root AND filter group.
     pub fn with_or_filters(mut self, children: Vec<FilterExpression>) -> Self {
         self.query
-            .filter_expression
+            .filters
             .children
             .push(FilterExpression::Group(FilterExpressionGroup::or(children)));
         self
@@ -362,7 +366,7 @@ mod tests {
     }
 
     fn collect_filters<T>(params: &QueryParams<T>) -> Vec<Filter> {
-        params.filter_expression.collect_conditions()
+        params.filters.collect_conditions()
     }
 
     #[test]
