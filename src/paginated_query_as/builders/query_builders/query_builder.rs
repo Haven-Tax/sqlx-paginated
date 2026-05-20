@@ -1320,6 +1320,23 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_unknown_columns_skips_invalid_filter() {
+        let filter = Filter {
+            field: "nonexistent_column".to_string(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::Int(1),
+        };
+        let params = make_params_with_filter(filter);
+        let result = QueryBuilder::<TestModel, Postgres>::new()
+            .allow_unknown_columns()
+            .with_filters(&params)
+            .build()
+            .unwrap();
+
+        assert!(result.conditions.is_empty());
+    }
+
+    #[test]
     fn test_eq_filter_int_generates_bigint_cast() {
         let filter = Filter {
             field: "id".to_string(),

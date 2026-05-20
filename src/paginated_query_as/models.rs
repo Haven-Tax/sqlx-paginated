@@ -611,11 +611,18 @@ mod tests {
         }
     }
 
-        #[test]
+    #[test]
     fn test_sort_item_expression_to_sql_preserves_expression() {
         assert_eq!(
             SortItem::expression("LOWER(name)").to_sql("ignored"),
             "LOWER(name)"
         );
+    }
+
+    #[test]
+    fn test_query_build_error_converts_to_paginated_query_error() {
+        let build_err = QueryBuildError::new("unknown or disallowed filter column: foo");
+        let paginated_err: PaginatedQueryError = build_err.into();
+        assert!(matches!(paginated_err, PaginatedQueryError::QueryBuild(e) if e.message.contains("foo")));
     }
 }
