@@ -1,4 +1,5 @@
 use crate::paginated_query_as::QueryBuildResult;
+use crate::paginated_query_as::models::QueryBuildError;
 use crate::{QueryBuilder, QueryParams};
 use serde::Serialize;
 
@@ -10,7 +11,7 @@ pub mod postgres_examples {
     #[allow(dead_code)]
     pub fn build_query_with_disabled_protection<T>(
         params: &QueryParams<T>,
-    ) -> QueryBuildResult<'static, Postgres>
+    ) -> Result<QueryBuildResult<'static, Postgres>, QueryBuildError>
     where
         T: Default + Serialize + 'static,
     {
@@ -25,7 +26,7 @@ pub mod postgres_examples {
     #[allow(dead_code)]
     pub fn build_query_with_safe_defaults<T>(
         params: &QueryParams<T>,
-    ) -> QueryBuildResult<'static, Postgres>
+    ) -> Result<QueryBuildResult<'static, Postgres>, QueryBuildError>
     where
         T: Default + Serialize + 'static,
     {
@@ -56,7 +57,7 @@ pub mod postgres_examples {
                 .with_search("XXX", vec!["description"])
                 .build();
 
-            let result = build_query_with_safe_defaults::<TestModel>(&params);
+            let result = build_query_with_safe_defaults::<TestModel>(&params).unwrap();
 
             assert!(!result.conditions.is_empty());
             assert!(result.conditions.iter().any(|c| c.contains(" ILIKE ")));
@@ -68,7 +69,7 @@ pub mod postgres_examples {
                 .with_search("   ", vec!["name"])
                 .build();
 
-            let result = build_query_with_safe_defaults::<TestModel>(&params);
+            let result = build_query_with_safe_defaults::<TestModel>(&params).unwrap();
             assert!(!result
                 .conditions
                 .iter()
@@ -85,7 +86,7 @@ pub mod sqlite_examples {
     #[allow(dead_code)]
     pub fn builder_new_query_with_disabled_protection_for_sqlite<'q, T>(
         params: &'q QueryParams<T>,
-    ) -> QueryBuildResult<'q, Sqlite>
+    ) -> Result<QueryBuildResult<'q, Sqlite>, QueryBuildError>
     where
         T: Default + Serialize,
     {
@@ -117,7 +118,8 @@ pub mod sqlite_examples {
                 .build();
 
             let result =
-                builder_new_query_with_disabled_protection_for_sqlite::<TestModel>(&params);
+                builder_new_query_with_disabled_protection_for_sqlite::<TestModel>(&params)
+                    .unwrap();
             assert!(!result
                 .conditions
                 .iter()

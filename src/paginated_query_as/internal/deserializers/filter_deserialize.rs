@@ -1,97 +1,23 @@
+use super::filter_bracket::{
+    bracket_insert, bracket_tree_is_empty, bracket_tree_to_expression, is_logical_bracket_field,
+    new_bracket_tree, parse_bracket_path, parse_query_value,
+};
+use super::filter_condition::{parse_condition, ConditionSyntax};
 use super::FilterParseError;
-use crate::paginated_query_as::models::{Filter, FilterOperator, FilterValue};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use crate::paginated_query_as::models::{FilterExpression, FilterExpressionGroup};
 use serde::{de::Error, Deserialize, Deserializer};
 use std::collections::HashMap;
 
-/// Parses a string into a FilterOperator enum variant.
-/// Returns Err with the raw operator string if invalid.
-fn parse_operator(s: &str) -> Result<FilterOperator, String> {
-    match s {
-        "Eq" => Ok(FilterOperator::Eq),
-        "Ne" => Ok(FilterOperator::Ne),
-        "Gt" => Ok(FilterOperator::Gt),
-        "Lt" => Ok(FilterOperator::Lt),
-        "Gte" => Ok(FilterOperator::Gte),
-        "Lte" => Ok(FilterOperator::Lte),
-        "Like" => Ok(FilterOperator::Like),
-        "ILike" => Ok(FilterOperator::ILike),
-        "In" => Ok(FilterOperator::In),
-        "NotIn" => Ok(FilterOperator::NotIn),
-        "IsNull" => Ok(FilterOperator::IsNull),
-        "IsNotNull" => Ok(FilterOperator::IsNotNull),
-        "Between" => Ok(FilterOperator::Between),
-        "Contains" => Ok(FilterOperator::Contains),
-        _ => Err(s.to_string()),
-    }
-}
+const RESERVED_QUERY_PARAMS: &[&str] = &[
+    "page",
+    "page_size",
+    "sort_column",
+    "sort_direction",
+    "search",
+    "search_columns",
+];
 
-/// Parses a string value into a FilterValue with automatic type inference.
-/// Type inference order: Bool -> Uuid -> DateTime -> Date -> Time -> Int -> Float -> String
-fn parse_filter_value(s: &str) -> FilterValue {
-    if s.is_empty() {
-        return FilterValue::Null;
-    }
-
-    // Try boolean
-    match s.to_lowercase().as_str() {
-        "true" => return FilterValue::Bool(true),
-        "false" => return FilterValue::Bool(false),
-        _ => {}
-    }
-
-    // Try UUID
-    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-        return FilterValue::Uuid(uuid);
-    }
-
-    // Try DateTime (RFC 3339 / ISO 8601 with timezone)
-    // Examples: 2025-12-02T10:30:00Z, 2025-12-02T10:30:00+00:00
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
-        return FilterValue::DateTime(dt.to_utc().to_string());
-    }
-
-    // Try NaiveDateTime (ISO 8601 without timezone)
-    // Examples: 2025-12-02T10:30:00, 2025-12-02 10:30:00
-    if NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
-        || NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").is_ok()
-        || NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
-    {
-        return FilterValue::DateTime(s.to_string());
-    }
-
-    // Try Date (YYYY-MM-DD)
-    if NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
-        return FilterValue::Date(s.to_string());
-    }
-
-    // Try Time (HH:MM:SS)
-    if NaiveTime::parse_from_str(s, "%H:%M:%S").is_ok()
-        || NaiveTime::parse_from_str(s, "%H:%M").is_ok()
-    {
-        return FilterValue::Time(s.to_string());
-    }
-
-    // Try integer
-    if let Ok(i) = s.parse::<i64>() {
-        return FilterValue::Int(i);
-    }
-
-    // Try float
-    if let Ok(f) = s.parse::<f64>() {
-        return FilterValue::Float(f);
-    }
-
-    // Fallback to string
-    FilterValue::String(s.to_string())
-}
-
-/// Parses comma-separated values into a Vec<FilterValue>.
-fn parse_array_values(s: &str) -> Vec<FilterValue> {
-    s.split(',').map(|v| parse_filter_value(v.trim())).collect()
-}
-
-/// Deserializes query parameters into a Vec<Filter>.
+/// Deserializes query parameters into a root AND filter expression group.
 ///
 /// Expected format: `field=Operator:value`
 /// Examples:
@@ -99,7 +25,9 @@ fn parse_array_values(s: &str) -> Vec<FilterValue> {
 /// - `?age=Gt:18` -> Filter { field: "age", operator: Gt, value: Int(18) }
 /// - `?status=In:Active,Pending` -> Filter { field: "status", operator: In, value: Array([...]) }
 /// - `?deleted_at=IsNull:` -> Filter { field: "deleted_at", operator: IsNull, value: Null }
-pub fn filters_deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<Filter>>, D::Error>
+pub fn filters_deserialize<'de, D>(
+    deserializer: D,
+) -> Result<Option<FilterExpressionGroup>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -111,73 +39,186 @@ where
         Some(m) => m,
     };
 
-    let mut filters = Vec::new();
+    let mut children = Vec::new();
+    let mut bracket_filters = new_bracket_tree();
 
     for (field, raw_value) in map {
-        if matches!(
-            field.as_str(),
-            "page" | "page_size" | "sort_column" | "sort_direction" | "search" | "search_columns"
-        ) {
+        if RESERVED_QUERY_PARAMS.contains(&field.as_str()) {
             continue;
         }
 
-        let (operator_str, value_str) = raw_value.split_once(':').ok_or_else(|| {
-            D::Error::custom(FilterParseError::InvalidFilterFormat {
-                field: field.clone(),
-                raw_value: raw_value.clone(),
-            })
-        })?;
+        if let Some(path) = parse_bracket_path(&field) {
+            bracket_insert(
+                &mut bracket_filters,
+                &path,
+                parse_query_value(raw_value),
+            )
+            .map_err(D::Error::custom)?;
+            continue;
+        }
 
-        let operator = parse_operator(operator_str).map_err(|raw_op| {
-            D::Error::custom(FilterParseError::InvalidOperator {
-                field: field.clone(),
-                raw_operator: raw_op,
-            })
-        })?;
+        if is_logical_bracket_field(&field)
+            || (field.starts_with('[') && (field.contains("$and") || field.contains("$or")))
+        {
+            return Err(D::Error::custom(FilterParseError::InvalidLogicalFilter {
+                path: field,
+                reason: "malformed logical filter path".to_string(),
+            }));
+        }
 
-        let value = match operator {
-            FilterOperator::IsNull | FilterOperator::IsNotNull => FilterValue::Null,
-            FilterOperator::In | FilterOperator::NotIn | FilterOperator::Between => {
-                FilterValue::Array(parse_array_values(value_str))
-            }
-            _ => parse_filter_value(value_str),
-        };
-
-        filters.push(Filter {
-            field,
-            operator,
-            value,
-        });
+        let filter =
+            parse_condition(&field, &raw_value, ConditionSyntax::Flat).map_err(D::Error::custom)?;
+        children.push(FilterExpression::Condition(filter));
     }
 
-    if filters.is_empty() {
+    if !bracket_tree_is_empty(&bracket_filters) {
+        children.push(
+            bracket_tree_to_expression(bracket_filters).map_err(D::Error::custom)?,
+        );
+    }
+
+    if children.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(filters))
+        Ok(Some(FilterExpressionGroup::and(children)))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::filter_value::{parse_array_values, parse_filter_value};
     use super::*;
+    use crate::paginated_query_as::models::{
+        FilterExpression, FilterOperator, FilterValue, LogicalOperator,
+    };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestParams {
+        #[serde(flatten, default, deserialize_with = "filters_deserialize")]
+        filters: Option<FilterExpressionGroup>,
+    }
 
     #[test]
     fn test_parse_operator() {
-        assert_eq!(parse_operator("Eq"), Ok(FilterOperator::Eq));
-        assert_eq!(parse_operator("Ne"), Ok(FilterOperator::Ne));
-        assert_eq!(parse_operator("Gt"), Ok(FilterOperator::Gt));
-        assert_eq!(parse_operator("Lt"), Ok(FilterOperator::Lt));
-        assert_eq!(parse_operator("Gte"), Ok(FilterOperator::Gte));
-        assert_eq!(parse_operator("Lte"), Ok(FilterOperator::Lte));
-        assert_eq!(parse_operator("Like"), Ok(FilterOperator::Like));
-        assert_eq!(parse_operator("ILike"), Ok(FilterOperator::ILike));
-        assert_eq!(parse_operator("In"), Ok(FilterOperator::In));
-        assert_eq!(parse_operator("NotIn"), Ok(FilterOperator::NotIn));
-        assert_eq!(parse_operator("IsNull"), Ok(FilterOperator::IsNull));
-        assert_eq!(parse_operator("IsNotNull"), Ok(FilterOperator::IsNotNull));
-        assert_eq!(parse_operator("Between"), Ok(FilterOperator::Between));
-        assert_eq!(parse_operator("Contains"), Ok(FilterOperator::Contains));
-        assert_eq!(parse_operator("Invalid"), Err("Invalid".to_string()));
+        assert_eq!("Eq".parse(), Ok(FilterOperator::Eq));
+        assert_eq!("Ne".parse(), Ok(FilterOperator::Ne));
+        assert_eq!("Gt".parse(), Ok(FilterOperator::Gt));
+        assert_eq!("Lt".parse(), Ok(FilterOperator::Lt));
+        assert_eq!("Gte".parse(), Ok(FilterOperator::Gte));
+        assert_eq!("Lte".parse(), Ok(FilterOperator::Lte));
+        assert_eq!("Like".parse(), Ok(FilterOperator::Like));
+        assert_eq!("ILike".parse(), Ok(FilterOperator::ILike));
+        assert_eq!("In".parse(), Ok(FilterOperator::In));
+        assert_eq!("NotIn".parse(), Ok(FilterOperator::NotIn));
+        assert_eq!("IsNull".parse(), Ok(FilterOperator::IsNull));
+        assert_eq!("IsNotNull".parse(), Ok(FilterOperator::IsNotNull));
+        assert_eq!("Between".parse(), Ok(FilterOperator::Between));
+        assert_eq!("Contains".parse(), Ok(FilterOperator::Contains));
+        assert_eq!(
+            "Invalid".parse::<FilterOperator>(),
+            Err("Invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn test_flat_filters_deserialize_into_root_and_group() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "status": "Eq:active",
+            "age": "Gte:18"
+        }))
+        .unwrap();
+
+        let group = params.filters.unwrap();
+        assert_eq!(group.operator, LogicalOperator::And);
+        assert_eq!(group.children.len(), 2);
+    }
+
+    #[test]
+    fn test_bracket_logical_filters_deserialize() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "$and[0][$or][0][username]": "Eq:phiberber",
+            "$and[0][$or][1][age]": "Gte:18",
+            "$and[1][organizationId]": "Eq:550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        let conditions = root.collect_conditions();
+        assert_eq!(conditions.len(), 3);
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "username"
+                && filter.operator == FilterOperator::Eq
+                && filter.value == FilterValue::String("phiberber".to_string())
+        }));
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "age"
+                && filter.operator == FilterOperator::Gte
+                && filter.value == FilterValue::Int(18)
+        }));
+        assert!(conditions.iter().any(|filter| {
+            filter.field == "organizationId" && filter.operator == FilterOperator::Eq
+        }));
+    }
+
+    #[test]
+    fn test_bracket_is_not_null_filter_deserialize() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "$and[0][deleted_at]": "IsNotNull"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.children.len(), 1);
+
+        let FilterExpression::Group(and_group) = &root.children[0] else {
+            panic!("expected nested AND group");
+        };
+        assert_eq!(and_group.children.len(), 1);
+
+        let FilterExpression::Condition(filter) = &and_group.children[0] else {
+            panic!("expected condition");
+        };
+        assert_eq!(filter.field, "deleted_at");
+        assert_eq!(filter.operator, FilterOperator::IsNotNull);
+        assert_eq!(filter.value, FilterValue::Null);
+    }
+
+    #[test]
+    fn test_old_bracket_operator_key_is_rejected() {
+        let params = serde_json::from_value::<TestParams>(serde_json::json!({
+            "$and[0][username][Eq]": "phiberber"
+        }));
+
+        assert!(params.is_err());
+    }
+
+    #[test]
+    fn test_malformed_logical_bracket_key_is_rejected() {
+        let params = serde_json::from_value::<TestParams>(serde_json::json!({
+            "$or[1][$or[0][status]]": "Eq:Scheduled"
+        }));
+
+        assert!(params.is_err());
+    }
+
+    #[test]
+    fn test_logical_bracket_key_with_opening_bracket_parses() {
+        let params: TestParams = serde_json::from_value(serde_json::json!({
+            "[$or][0][status]": "Eq:Pending"
+        }))
+        .unwrap();
+
+        let root = params.filters.unwrap();
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.children.len(), 1);
+        assert!(matches!(
+            &root.children[0],
+            FilterExpression::Group(group) if group.operator == LogicalOperator::Or
+        ));
+        assert_eq!(root.collect_conditions().len(), 1);
     }
 
     #[test]
